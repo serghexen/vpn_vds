@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CLIENTS_JSON="${CLIENTS_JSON:-/var/lib/vless-sub/clients.json}"
+XRAY_CFG="${XRAY_CFG:-/usr/local/etc/xray/config.json}"
+XRAY_BIN="${XRAY_BIN:-/usr/local/bin/xray}"
+XRAY_AUTORELOAD="${XRAY_AUTORELOAD:-0}"
+XRAY_RESTART_CMD="${XRAY_RESTART_CMD:-}"
+GRACE_DAYS=3
+APPLY=0
+NOW_TS=""
+
+usage() {
+  cat <<USAGE
+Usage:
+  vless-sync-expire [--apply] [--grace-days N] [--now-ts UNIX]
+
+Modes:
+  default: dry-run (no changes)
+  --apply: write xray config and restart xray if needed
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --apply)
+      APPLY=1; shift ;;
+    --grace-days)
+      GRACE_DAYS="${2:-}"; shift 2 ;;
+    --now-ts)
+      NOW_TS="${2:-}"; shift 2 ;;
+    -h|--help)
+      usage; exit 0 ;;
+    *)
+      echo "Unknown arg: $1" >&2
+      usage
+      exit 1 ;;
+  esac
+done
+
+if ! [[ "$GRACE_DAYS" =~ ^[0-9]+$ ]]; then
+  echo "--grace-days must be non-negative integer" >&2
+  exit 1
+fi
+
+if [[ -z "$NOW_TS" ]]; then
+  NOW_TS="$(date +%s)"
+fi
+
+if ! [[ "$NOW_TS" =~ ^[0-9]+$ ]]; then
+  echo "--now-ts must be integer" >&2
+  exit 1
+fi
+
+export CLIENTS_JSON XRAY_CFG XRAY_BIN XRAY_AUTORELOAD XRAY_RESTART_CMD NOW_TS GRACE_DAYS APPLY
+python3 - <<'PY'
+import json, os, subprocess, sys, tempfile, shutil
+from pathlib import Path
+
+clients_path = Path(os.environ['CLIENTS_JSON'])
+xray_path = Path(os.environ['XRAY_CFG'])
+now_ts = int(os.environ['NOW_TS'])
+grace_days = int(os.environ['GRACE_DAYS'])
+apply = os.environ['APPLY'] == '1'
+xray_bin = os.environ.get('XRAY_BIN', '')
+xray_autoreload = os.environ.get('XRAY_AUTORELOAD', '0') == '1'
+xray_restart_cmd = os.environ.get('XRAY_RESTART_CMD', '')
+
+clients = json.loads(clients_path.read_text(encoding='utf-8'))
+xray = json.loads(xray_path.read_text(encoding='utf-8'))
+
+vless_ib = None
+for ib in xray.get('inbounds', []):
+    if ib.get('protocol') == 'vless':
+        vless_ib = ib
+        break
+
+if vless_ib is None:
+    print('ERROR: no vless inbound in xray config', file=sys.stderr)
+    sys.exit(1)
+
+grace_sec = grace_days * 86400
+
+def status_of(row):
+    if row.get('revoked', False):
+        return 'suspended'
+    exp = int(row.get('expire', 0) or 0)
+    if exp <= 0:
+        return 'active'
+    if now_ts <= exp:
+        return 'active'
+    if now_ts <= exp + grace_sec:
+        return 'grace'
+    return 'suspended'
+
+active_rows = []
+stats = {'active': 0, 'grace': 0, 'suspended': 0}
+for r in clients:
+    st = status_of(r)
+    stats[st] += 1
+    if st in ('active', 'grace'):
+        active_rows.append(r)
+
+new_clients = []
+for r in active_rows:
+    new_clients.append({
+        'id': r['uuid'],
+        'flow': 'xtls-rprx-vision',
+        'email': r['name'],
+    })
+
+cur_clients = vless_ib.get('settings', {}).get('clients', [])
+cur_ids = [c.get('id') for c in cur_clients if c.get('id')]
+new_ids = [c.get('id') for c in new_clients if c.get('id')]
+
+to_add = sorted(set(new_ids) - set(cur_ids))
+to_remove = sorted(set(cur_ids) - set(new_ids))
+changed = (cur_ids != new_ids)
+
+print(f'NOW_TS {now_ts}')
+print(f'GRACE_DAYS {grace_days}')
+print(f'STATS active={stats["active"]} grace={stats["grace"]} suspended={stats["suspended"]}')
+print(f'XRAY_CURRENT {len(cur_ids)}')
+print(f'XRAY_TARGET {len(new_ids)}')
+print(f'PLAN add={len(to_add)} remove={len(to_remove)} changed={str(changed).lower()}')
+
+if to_add:
+    print('ADD_IDS')
+    for x in to_add:
+        print(x)
+if to_remove:
+    print('REMOVE_IDS')
+    for x in to_remove:
+        print(x)
+
+if not apply:
+    print('MODE dry-run (no changes)')
+    sys.exit(0)
+
+if not changed:
+    print('MODE apply (no changes needed)')
+    sys.exit(0)
+
+vless_ib.setdefault('settings', {})['clients'] = new_clients
+
+tmp_fd, tmp_name = tempfile.mkstemp(prefix='xray-config-', suffix='.json')
+os.close(tmp_fd)
+Path(tmp_name).write_text(json.dumps(xray, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+
+# validate before replace if xray binary exists
+if xray_bin and Path(xray_bin).exists():
+    res = subprocess.run([xray_bin, 'run', '-test', '-config', tmp_name], capture_output=True, text=True)
+    if res.returncode != 0:
+        print('ERROR: xray config test failed', file=sys.stderr)
+        print(res.stdout, file=sys.stderr)
+        print(res.stderr, file=sys.stderr)
+        Path(tmp_name).unlink(missing_ok=True)
+        sys.exit(1)
+else:
+    print(f'WARN: xray binary not found at {xray_bin}, config test skipped')
+
+# backup and replace atomically
+backup_path = xray_path.with_name(xray_path.name + '.sync.bak')
+shutil.copy2(xray_path, backup_path)
+shutil.move(tmp_name, xray_path)
+
+if xray_autoreload:
+    print('RELOAD managed by autoreload mode, systemctl restart skipped')
+elif xray_restart_cmd:
+    res2 = subprocess.run(['sh', '-c', xray_restart_cmd], capture_output=True, text=True)
+    if res2.returncode != 0:
+        print('ERROR: custom xray restart command failed', file=sys.stderr)
+        print(res2.stdout, file=sys.stderr)
+        print(res2.stderr, file=sys.stderr)
+        sys.exit(1)
+elif shutil.which('systemctl'):
+    res2 = subprocess.run(['systemctl', 'restart', 'xray'])
+    if res2.returncode != 0:
+        print('ERROR: failed to restart xray', file=sys.stderr)
+        sys.exit(1)
+else:
+    print('WARN: systemctl not found, restart skipped')
+
+print(f'APPLIED backup={backup_path}')
+PY

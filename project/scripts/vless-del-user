@@ -1,0 +1,343 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+UK_HOST="${UK_HOST:-}"
+TR_HOST="${TR_HOST:-}"
+SSH_KEY="${SSH_KEY:-/root/.ssh/vless_sync_ed25519}"
+LOCK_FILE="/var/lock/vless-del-user.lock"
+XRAY_BIN="${XRAY_BIN:-/usr/local/bin/xray}"
+XRAY_AUTORELOAD="${XRAY_AUTORELOAD:-0}"
+XRAY_RESTART_CMD="${XRAY_RESTART_CMD:-}"
+
+restart_local_xray() {
+  if [[ -n "$XRAY_RESTART_CMD" ]]; then
+    sh -c "$XRAY_RESTART_CMD"
+    return
+  fi
+  if [[ "$XRAY_AUTORELOAD" == "1" ]]; then
+    echo "INFO: XRAY_AUTORELOAD=1, local systemctl restart skipped" >&2
+    return
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl restart xray
+    return
+  fi
+  echo "WARN: no xray restart method available" >&2
+}
+
+usage() {
+  cat <<USAGE
+Usage:
+  vless-del-user --name <name>
+
+Example:
+  vless-del-user --name alice
+USAGE
+}
+
+NAME=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --name)
+      NAME="${2:-}"; shift 2 ;;
+    -h|--help)
+      usage; exit 0 ;;
+    *)
+      echo "Unknown arg: $1" >&2
+      usage
+      exit 1 ;;
+  esac
+done
+
+if [[ -z "$NAME" ]]; then
+  usage
+  exit 1
+fi
+
+if [[ ! "$NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  echo "Invalid name. Allowed: A-Z a-z 0-9 . _ -" >&2
+  exit 1
+fi
+
+TS="$(date +%F_%H-%M-%S)"
+BKP_DIR="/var/backups/vless"
+mkdir -p "$BKP_DIR"
+
+CLIENTS_JSON="/var/lib/vless-sub/clients.json"
+XRAY_CFG="/usr/local/etc/xray/config.json"
+SUB_DIR="/var/www/sub"
+BKP_CLIENTS="$BKP_DIR/clients.json.del.bak.$TS"
+BKP_CFG="$BKP_DIR/config.json.del.bak.$TS"
+BKP_SUB_TOKEN="$BKP_DIR/sub.token.del.bak.$TS"
+BKP_SUB_NAME="$BKP_DIR/sub.name.del.bak.$TS"
+
+SUCCESS=0
+MASTER_CHANGED=0
+REMOTE_UK_CHANGED=0
+REMOTE_TR_CHANGED=0
+U_NAME=""
+U_UUID=""
+U_TOKEN=""
+UK_UUID=""
+TR_UUID=""
+
+remote_has_uuid() {
+  local host="$1"
+  local uuid="$2"
+  [[ -z "$uuid" ]] && { echo "NO"; return 0; }
+  ssh -n -i "${SSH_KEY}" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 "root@${host}" "UUID='${uuid}' python3 - <<'PY'
+import os, json
+uuid=os.environ['UUID']
+cfg=json.load(open('/usr/local/etc/xray/config.json','r',encoding='utf-8'))
+for ib in cfg.get('inbounds',[]):
+    if ib.get('protocol')!='vless':
+        continue
+    for c in ib.get('settings',{}).get('clients',[]):
+        if c.get('id')==uuid:
+            print('YES')
+            raise SystemExit(0)
+print('NO')
+PY" | tail -n1
+}
+
+remove_remote_uuid() {
+  local host="$1"
+  local uuid="$2"
+  [[ -z "$uuid" ]] && { echo "NOT_SET"; return 0; }
+
+  ssh -n -i "${SSH_KEY}" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 "root@${host}" "UUID='${uuid}' python3 - <<'PY'
+import os, json
+p='/usr/local/etc/xray/config.json'
+cfg=json.load(open(p,'r',encoding='utf-8'))
+uuid=os.environ['UUID']
+removed=0
+for ib in cfg.get('inbounds',[]):
+    if ib.get('protocol')!='vless':
+        continue
+    cur=ib.get('settings',{}).get('clients',[])
+    new=[]
+    for c in cur:
+        if c.get('id')==uuid:
+            removed += 1
+            continue
+        new.append(c)
+    ib.setdefault('settings',{})['clients']=new
+json.dump(cfg,open(p,'w',encoding='utf-8'),ensure_ascii=False,indent=2)
+open(p,'a',encoding='utf-8').write('\\n')
+print('REMOVED', removed)
+PY
+/usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json >/dev/null
+systemctl restart xray" | tail -n1
+}
+
+add_remote_uuid() {
+  local host="$1"
+  local uuid="$2"
+  local name="$3"
+  [[ -z "$uuid" ]] && return 0
+
+  ssh -n -i "${SSH_KEY}" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 "root@${host}" "UUID='${uuid}' NAME='${name}' python3 - <<'PY'
+import os, json
+p='/usr/local/etc/xray/config.json'
+cfg=json.load(open(p,'r',encoding='utf-8'))
+uuid=os.environ['UUID']
+name=os.environ['NAME']
+for ib in cfg.get('inbounds',[]):
+    if ib.get('protocol')!='vless':
+        continue
+    clients=ib.setdefault('settings',{}).setdefault('clients',[])
+    if any(c.get('id')==uuid for c in clients):
+        break
+    clients.append({'id':uuid,'flow':'xtls-rprx-vision','email':name})
+    break
+json.dump(cfg,open(p,'w',encoding='utf-8'),ensure_ascii=False,indent=2)
+open(p,'a',encoding='utf-8').write('\\n')
+PY
+/usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json >/dev/null
+systemctl restart xray"
+}
+
+cleanup_on_error() {
+  local rc=$?
+  [[ "$SUCCESS" -eq 1 ]] && return 0
+
+  echo "ERROR: del-user failed (rc=$rc), starting rollback..." >&2
+
+  if [[ "$MASTER_CHANGED" -eq 1 ]]; then
+    cp "$BKP_CLIENTS" "$CLIENTS_JSON" || true
+    cp "$BKP_CFG" "$XRAY_CFG" || true
+    if [[ -s "$BKP_SUB_TOKEN" && -n "$U_TOKEN" ]]; then
+      cp "$BKP_SUB_TOKEN" "$SUB_DIR/$U_TOKEN" || true
+    fi
+    if [[ -s "$BKP_SUB_NAME" && -n "$U_NAME" ]]; then
+      cp "$BKP_SUB_NAME" "$SUB_DIR/$U_NAME" || true
+    fi
+    if [[ -x "$XRAY_BIN" ]]; then
+      "$XRAY_BIN" run -test -config "$XRAY_CFG" >/dev/null 2>&1 || true
+    fi
+    restart_local_xray || true
+  fi
+
+  if [[ "$REMOTE_UK_CHANGED" -eq 1 && -n "$UK_HOST" ]]; then
+    add_remote_uuid "$UK_HOST" "$UK_UUID" "$U_NAME" || true
+  fi
+  if [[ "$REMOTE_TR_CHANGED" -eq 1 && -n "$TR_HOST" ]]; then
+    add_remote_uuid "$TR_HOST" "$TR_UUID" "$U_NAME" || true
+  fi
+
+  echo "Rollback complete." >&2
+  exit "$rc"
+}
+trap cleanup_on_error ERR INT TERM
+
+# lock to avoid concurrent runs
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "Another vless-del-user run is in progress. Try again later." >&2
+  exit 1
+fi
+
+cp "$CLIENTS_JSON" "$BKP_CLIENTS"
+cp "$XRAY_CFG" "$BKP_CFG"
+
+# Extract target user info + backup uuids from current subscription links
+export NAME UK_HOST TR_HOST
+INFO_JSON="$(python3 - <<'PY'
+import os, json, base64, re, sys
+from pathlib import Path
+
+name = os.environ['NAME']
+uk_host = os.environ.get('UK_HOST', '').strip()
+tr_host = os.environ.get('TR_HOST', '').strip()
+clients = json.load(open('/var/lib/vless-sub/clients.json','r',encoding='utf-8'))
+row = next((x for x in clients if x.get('name') == name), None)
+if not row:
+    print('NOT_FOUND')
+    sys.exit(0)
+
+uk = ''
+tr = ''
+sub_file = Path('/var/www/sub') / row['token']
+if sub_file.exists():
+    try:
+        dec = base64.b64decode(sub_file.read_text(encoding='utf-8').strip()).decode('utf-8')
+        for l in [x.strip() for x in dec.splitlines() if x.strip()]:
+            m = re.search(r'^vless://([0-9a-fA-F-]{36})@([^:/?#]+)', l)
+            if not m:
+                continue
+            uid, host = m.group(1), m.group(2)
+            if uk_host and host == uk_host:
+                uk = uid
+            elif tr_host and host == tr_host:
+                tr = uid
+    except Exception:
+        pass
+
+print(json.dumps({
+    'name': row.get('name',''),
+    'uuid': row.get('uuid',''),
+    'token': row.get('token',''),
+    'uk_uuid': uk,
+    'tr_uuid': tr,
+}, ensure_ascii=False))
+PY
+)"
+
+if [[ "$INFO_JSON" == "NOT_FOUND" ]]; then
+  echo "User not found: $NAME" >&2
+  exit 1
+fi
+
+readarray -t FIELDS < <(python3 - "$INFO_JSON" <<'PY'
+import json, sys
+obj = json.loads(sys.argv[1])
+print(obj.get('name',''))
+print(obj.get('uuid',''))
+print(obj.get('token',''))
+print(obj.get('uk_uuid',''))
+print(obj.get('tr_uuid',''))
+PY
+)
+
+U_NAME="${FIELDS[0]}"
+U_UUID="${FIELDS[1]}"
+U_TOKEN="${FIELDS[2]}"
+UK_UUID="${FIELDS[3]}"
+TR_UUID="${FIELDS[4]}"
+
+[[ -n "$U_TOKEN" && -f "$SUB_DIR/$U_TOKEN" ]] && cp "$SUB_DIR/$U_TOKEN" "$BKP_SUB_TOKEN" || true
+[[ -n "$U_NAME" && -f "$SUB_DIR/$U_NAME" ]] && cp "$SUB_DIR/$U_NAME" "$BKP_SUB_NAME" || true
+
+# Remove on master db/config
+export U_NAME U_UUID
+python3 - <<'PY'
+import os, json
+from pathlib import Path
+
+name = os.environ['U_NAME']
+uuid = os.environ['U_UUID']
+clients_path = Path('/var/lib/vless-sub/clients.json')
+xray_path = Path('/usr/local/etc/xray/config.json')
+
+clients = json.loads(clients_path.read_text(encoding='utf-8'))
+clients = [c for c in clients if c.get('name') != name]
+clients_path.write_text(json.dumps(clients, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+
+xray = json.loads(xray_path.read_text(encoding='utf-8'))
+for ib in xray.get('inbounds', []):
+    if ib.get('protocol') != 'vless':
+        continue
+    cur = ib.get('settings', {}).get('clients', [])
+    ib.setdefault('settings', {})['clients'] = [c for c in cur if c.get('id') != uuid]
+
+xray_path.write_text(json.dumps(xray, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+PY
+
+rm -f "$SUB_DIR/$U_TOKEN" "$SUB_DIR/$U_NAME" || true
+MASTER_CHANGED=1
+
+if [[ -x "$XRAY_BIN" ]]; then
+  "$XRAY_BIN" run -test -config "$XRAY_CFG" >/dev/null 2>&1
+else
+  echo "WARN: xray binary not found at $XRAY_BIN, local config test skipped" >&2
+fi
+restart_local_xray
+
+# Remove on backups by UUID
+if [[ -n "$UK_HOST" && -n "$UK_UUID" ]]; then
+  uk_res="$(remove_remote_uuid "$UK_HOST" "$UK_UUID")"
+  [[ "$uk_res" == REMOVED* ]] && REMOTE_UK_CHANGED=1
+fi
+if [[ -n "$TR_HOST" && -n "$TR_UUID" ]]; then
+  tr_res="$(remove_remote_uuid "$TR_HOST" "$TR_UUID")"
+  [[ "$tr_res" == REMOVED* ]] && REMOTE_TR_CHANGED=1
+fi
+
+if command -v /usr/local/sbin/happ-refresh-links >/dev/null 2>&1; then
+  /usr/local/sbin/happ-refresh-links >/dev/null 2>&1 || echo "WARN: happ links refresh failed" >&2
+fi
+
+# post-checks
+NAME="$U_NAME" python3 - <<'PY'
+import os, json
+name=os.environ['NAME']
+clients=json.load(open('/var/lib/vless-sub/clients.json','r',encoding='utf-8'))
+assert not any(c.get('name')==name for c in clients), 'post-check failed: user still in clients.json'
+print('POSTCHECK master_clients_removed OK')
+PY
+
+if [[ -n "$UK_HOST" && -n "$UK_UUID" ]]; then
+  [[ "$(remote_has_uuid "$UK_HOST" "$UK_UUID")" == "NO" ]] && echo "POSTCHECK uk_node_removed OK"
+fi
+if [[ -n "$TR_HOST" && -n "$TR_UUID" ]]; then
+  [[ "$(remote_has_uuid "$TR_HOST" "$TR_UUID")" == "NO" ]] && echo "POSTCHECK tr_node_removed OK"
+fi
+
+echo "REMOVED USER: $U_NAME"
+echo "MASTER_UUID: $U_UUID"
+echo "UK_UUID: ${UK_UUID:--}"
+echo "TR_UUID: ${TR_UUID:--}"
+echo "BACKUPS: $BKP_CLIENTS $BKP_CFG"
+
+SUCCESS=1
+trap - ERR INT TERM

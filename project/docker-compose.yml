@@ -1,0 +1,69 @@
+services:
+  xray:
+    image: ghcr.io/xtls/xray-core:latest
+    container_name: hexenvpn-xray
+    restart: unless-stopped
+    command: ["run", "-config", "/usr/local/etc/xray/config.json"]
+    ports:
+      - "443:443/tcp"
+    volumes:
+      - ./runtime/xray:/usr/local/etc/xray
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - hexenvpn
+
+  bot:
+    build:
+      context: ..
+      dockerfile: project/docker/bot/Dockerfile
+    container_name: hexenvpn-bot
+    restart: unless-stopped
+    depends_on:
+      - xray
+    env_file:
+      - ./env/bot.env
+      - ./env/nodes.env
+    environment:
+      DB_PATH: /var/lib/hexenvpn-bot/bot.db
+      CLIENTS_JSON: /var/lib/vless-sub/clients.json
+      ADD_USER_CMD: /usr/local/sbin/vless-add-user
+      DEL_USER_CMD: /usr/local/sbin/vless-del-user
+      SYNC_EXPIRE_CMD: /usr/local/sbin/vless-sync-expire
+      MONITOR_CMD: /usr/local/sbin/healthcheck-master-replicas
+      METRICS_CMD: /usr/local/sbin/metrics-master-light
+      MONITOR_ENABLED: "1"
+      MONITOR_INTERVAL_SEC: "300"
+      MONITOR_COOLDOWN_SEC: "1800"
+      XRAY_CFG: /usr/local/etc/xray/config.json
+      XRAY_BIN: ""
+      XRAY_AUTORELOAD: "0"
+      XRAY_RESTART_CMD: "nsenter -t 1 -m -u -i -n -p docker restart hexenvpn-xray >/dev/null"
+    pid: host
+    privileged: true
+    volumes:
+      - ./bot/bot.py:/opt/hexenvpn-bot/bot.py:ro
+      - ./scripts/vless-add-user:/usr/local/sbin/vless-add-user:ro
+      - ./scripts/vless-del-user:/usr/local/sbin/vless-del-user:ro
+      - ./scripts/vless-sync-expire:/usr/local/sbin/vless-sync-expire:ro
+      - ./scripts/healthcheck_master_replicas.sh:/usr/local/sbin/healthcheck-master-replicas:ro
+      - ./scripts/metrics_master_light.sh:/usr/local/sbin/metrics-master-light:ro
+      - ./runtime/bot:/var/lib/hexenvpn-bot
+      - ./runtime/vless-sub:/var/lib/vless-sub
+      - ./runtime/sub:/var/www/sub
+      - ./runtime/xray:/usr/local/etc/xray
+      - ./env/ssh:/root/.ssh:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - hexenvpn
+
+networks:
+  hexenvpn:
+    driver: bridge

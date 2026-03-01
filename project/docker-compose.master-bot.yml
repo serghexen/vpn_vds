@@ -1,0 +1,33 @@
+services:
+  bot:
+    build:
+      context: ..
+      dockerfile: project/docker/bot/Dockerfile
+    container_name: hexenvpn-bot
+    restart: unless-stopped
+    env_file:
+      - ./env/bot.env
+    environment:
+      DB_PATH: /var/lib/hexenvpn-bot/bot.db
+      CLIENTS_JSON: /var/lib/vless-sub/clients.json
+      ADD_USER_CMD: /usr/local/sbin/vless-add-user
+      DEL_USER_CMD: /usr/local/sbin/vless-del-user
+      SYNC_EXPIRE_CMD: /usr/local/sbin/vless-sync-expire
+      METRICS_CMD: /usr/local/sbin/metrics-master-light
+      XRAY_CFG: /usr/local/etc/xray/config.json
+      XRAY_BIN: ""
+      XRAY_AUTORELOAD: "0"
+      XRAY_RESTART_CMD: "nsenter -t 1 -m -u -i -n -p systemctl restart xray"
+    pid: host
+    privileged: true
+    volumes:
+      - ./bot/bot.py:/opt/hexenvpn-bot/bot.py:ro
+      - ./scripts/vless-add-user:/usr/local/sbin/vless-add-user:ro
+      - ./scripts/vless-del-user:/usr/local/sbin/vless-del-user:ro
+      - ./scripts/vless-sync-expire:/usr/local/sbin/vless-sync-expire:ro
+      - ./scripts/metrics_master_light.sh:/usr/local/sbin/metrics-master-light:ro
+      - /var/lib/hexenvpn-bot:/var/lib/hexenvpn-bot
+      - /var/lib/vless-sub:/var/lib/vless-sub
+      - /var/www/sub:/var/www/sub
+      - /usr/local/etc/xray:/usr/local/etc/xray
+      - /root/.ssh:/root/.ssh:ro

@@ -1,0 +1,15 @@
+# Secrets and runtime state
+project/master/
+project/env/bot.env
+project/xray/config.json
+project/state/clients.json
+project/state/*.db
+*.key
+*.pem
+
+project/replicas/*/usr/local/etc/xray/config.json
+project/runtime/
+project/env/ssh/
+
+__pycache__/
+*.pyc
