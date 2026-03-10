@@ -9,6 +9,7 @@ import time
 import traceback
 import hashlib
 import html
+import shlex
 from threading import Thread
 import urllib.request
 from datetime import datetime, timezone
@@ -60,6 +61,14 @@ DEVICE_BOOTSTRAP_BYTES = int(os.environ.get("DEVICE_BOOTSTRAP_BYTES", str(2 * 10
 DEVICE_LIST_LIMIT = int(os.environ.get("DEVICE_LIST_LIMIT", "12"))
 DEVICE_SOFT_LIMIT = int(os.environ.get("DEVICE_SOFT_LIMIT", "5"))
 ONLINE_WINDOW_SEC = int(os.environ.get("ONLINE_WINDOW_SEC", "900"))
+LIVE_ONLINE_ENABLED = os.environ.get("LIVE_ONLINE_ENABLED", "1").strip() == "1"
+LIVE_ONLINE_SAMPLE_SEC = int(os.environ.get("LIVE_ONLINE_SAMPLE_SEC", "3"))
+LIVE_ONLINE_TIMEOUT_SEC = int(os.environ.get("LIVE_ONLINE_TIMEOUT_SEC", "12"))
+LIVE_ONLINE_CACHE_TTL_SEC = int(os.environ.get("LIVE_ONLINE_CACHE_TTL_SEC", "20"))
+SSH_KEY_DEFAULT = "/root/.ssh/vless_sync_ed25519"
+SSH_KEY = os.environ.get("SSH_KEY", SSH_KEY_DEFAULT).strip() or SSH_KEY_DEFAULT
+UK_HOST = os.environ.get("UK_HOST", "").strip()
+TR_HOST = os.environ.get("TR_HOST", "").strip()
 ADMIN_TG_IDS = parse_int_set(os.environ.get("ADMIN_TG_IDS", ""))
 ADMIN_TG_USERNAMES = parse_str_set(os.environ.get("ADMIN_TG_USERNAMES", ""))
 PRIMARY_ADMIN_TG_ID = int(os.environ.get("PRIMARY_ADMIN_TG_ID", "227380225"))
@@ -132,6 +141,8 @@ PAYMENT_PLANS = {
     6: {"months": 6, "rub": 900, "stars": 950, "days": 180},
     12: {"months": 12, "rub": 1700, "stars": 1750, "days": 365},
 }
+
+_live_cache = {"ts": 0, "data": None}
 
 
 def api_call(method: str, payload: dict):
@@ -344,6 +355,127 @@ def online_users_count(conn: sqlite3.Connection):
     )
     row = cur.fetchone()
     return int((row or [0])[0] or 0)
+
+
+def _extract_json_obj(raw: str):
+    s = (raw or "").strip()
+    if not s:
+        return {}
+    i = s.find("{")
+    j = s.rfind("}")
+    if i < 0 or j < i:
+        return {}
+    try:
+        return json.loads(s[i : j + 1])
+    except Exception:
+        return {}
+
+
+def _parse_user_traffic_stats(raw: str):
+    obj = _extract_json_obj(raw)
+    stats = {}
+    for it in obj.get("stat", []) or []:
+        if not isinstance(it, dict):
+            continue
+        name = str(it.get("name") or "")
+        val = int(it.get("value") or 0)
+        m = re.fullmatch(r"user>>>(.+)>>>traffic>>>(uplink|downlink)", name)
+        if not m:
+            continue
+        user = (m.group(1) or "").strip()
+        kind = m.group(2)
+        if not user:
+            continue
+        rec = stats.setdefault(user, {"uplink": 0, "downlink": 0})
+        rec[kind] = val
+    return stats
+
+
+def _statsquery_local():
+    # master can run xray in docker; query via host namespace if available.
+    cmd = (
+        "nsenter -t 1 -m -u -i -n -p sh -lc "
+        + shlex.quote("docker exec hexenvpn-xray /usr/local/bin/xray api statsquery --server=127.0.0.1:10085")
+    )
+    rc, out = run_cmd(["sh", "-lc", cmd], timeout_sec=LIVE_ONLINE_TIMEOUT_SEC)
+    return rc, out
+
+
+def _statsquery_remote(host: str):
+    args = [
+        "ssh",
+        "-i",
+        SSH_KEY,
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "ConnectTimeout=8",
+        f"root@{host}",
+        "/usr/local/bin/xray api statsquery --server=127.0.0.1:10085",
+    ]
+    return run_cmd(args, timeout_sec=LIVE_ONLINE_TIMEOUT_SEC)
+
+
+def _collect_live_users_for_node(kind: str, host: str):
+    if kind == "master":
+        rc1, out1 = _statsquery_local()
+    else:
+        rc1, out1 = _statsquery_remote(host)
+    if rc1 != 0:
+        return {"ok": False, "error": (out1 or f"rc={rc1}")[:180], "users": set()}
+    s1 = _parse_user_traffic_stats(out1)
+    time.sleep(max(1, LIVE_ONLINE_SAMPLE_SEC))
+    if kind == "master":
+        rc2, out2 = _statsquery_local()
+    else:
+        rc2, out2 = _statsquery_remote(host)
+    if rc2 != 0:
+        return {"ok": False, "error": (out2 or f"rc={rc2}")[:180], "users": set()}
+    s2 = _parse_user_traffic_stats(out2)
+    live = set()
+    keys = set(s1.keys()) | set(s2.keys())
+    for k in keys:
+        a = s1.get(k, {})
+        b = s2.get(k, {})
+        du = int(b.get("uplink", 0)) - int(a.get("uplink", 0))
+        dd = int(b.get("downlink", 0)) - int(a.get("downlink", 0))
+        if (du + dd) > 0:
+            live.add(k)
+    return {"ok": True, "error": "", "users": live}
+
+
+def get_live_online_snapshot(force: bool = False):
+    now = int(time.time())
+    cached = _live_cache.get("data")
+    ts = int(_live_cache.get("ts") or 0)
+    if not force and cached is not None and (now - ts) <= LIVE_ONLINE_CACHE_TTL_SEC:
+        return cached
+
+    if not LIVE_ONLINE_ENABLED:
+        data = {"enabled": False, "nodes": {}, "all_users": set()}
+        _live_cache["ts"] = now
+        _live_cache["data"] = data
+        return data
+
+    nodes = {}
+    # Pilot priority: UK/TR by SSH; master best-effort via local docker exec.
+    if UK_HOST:
+        nodes[f"uk:{UK_HOST}"] = _collect_live_users_for_node("remote", UK_HOST)
+    if TR_HOST:
+        nodes[f"tr:{TR_HOST}"] = _collect_live_users_for_node("remote", TR_HOST)
+    nodes["master:local"] = _collect_live_users_for_node("master", "")
+
+    all_users = set()
+    for rec in nodes.values():
+        if rec.get("ok"):
+            all_users.update(rec.get("users") or set())
+
+    data = {"enabled": True, "nodes": nodes, "all_users": all_users}
+    _live_cache["ts"] = now
+    _live_cache["data"] = data
+    return data
 
 
 def promote_pending_devices(conn: sqlite3.Connection, vpn_name: str):
@@ -1718,11 +1850,23 @@ def show_admin_devices_overview(conn: sqlite3.Connection, msg: dict):
         parsed = 0
     rows = get_device_stats_by_user(conn, limit=12)
     online_total = online_users_count(conn)
+    live = get_live_online_snapshot(force=False)
+    live_users = live.get("all_users") or set()
     lines = [
         f"📱 Устройства (сбор без лимитов)",
         f"Обновлено записей: {parsed}",
         f"Онлайн сейчас (окно {int(ONLINE_WINDOW_SEC/60)} мин): {online_total}",
     ]
+    if live.get("enabled"):
+        lines.append(f"LIVE по трафику ({LIVE_ONLINE_SAMPLE_SEC}s): {len(live_users)}")
+        node_lines = []
+        for node_name, rec in (live.get("nodes") or {}).items():
+            if rec.get("ok"):
+                node_lines.append(f"{node_name}={len(rec.get('users') or set())}")
+            else:
+                node_lines.append(f"{node_name}=n/a")
+        if node_lines:
+            lines.append("Узлы: " + ", ".join(node_lines))
     if rows:
         lines.append("")
         lines.append("Топ пользователей по числу устройств:")
@@ -1734,9 +1878,10 @@ def show_admin_devices_overview(conn: sqlite3.Connection, msg: dict):
             else:
                 who = vpn_name
             last_seen = int(r[3] or 0)
+            live_mark = " 🟢LIVE" if vpn_name in live_users else ""
             lines.append(
                 f"{i}. {who} — активных {int(r[1] or 0)}, в ожидании {int(r[2] or 0)} "
-                f"({online_label(last_seen)}, последняя активность: {_fmt_ts(last_seen)})"
+                f"({online_label(last_seen)}, последняя активность: {_fmt_ts(last_seen)}){live_mark}"
             )
     else:
         lines.append("\nПока нет данных. Устройства появятся после запросов к /sub/*.")
@@ -1752,6 +1897,8 @@ def show_admin_user_devices(conn: sqlite3.Connection, msg: dict, vpn_name: str):
         print(f"[device-ingest-error] {e}", file=sys.stderr, flush=True)
 
     rows = get_devices_for_user(conn, vpn_name, limit=DEVICE_LIST_LIMIT)
+    live = get_live_online_snapshot(force=False)
+    live_users = live.get("all_users") or set()
     disp = display_name_for(conn, vpn_name) or vpn_name
     if disp != vpn_name:
         header_user = f"{disp} ({vpn_name})"
@@ -1767,6 +1914,7 @@ def show_admin_user_devices(conn: sqlite3.Connection, msg: dict, vpn_name: str):
         f"📱 Устройства пользователя {header_user}",
         f"Показано: {len(rows)} (макс {DEVICE_LIST_LIMIT})",
         f"Активных: {active_count}/{DEVICE_SOFT_LIMIT}, в ожидании: {pending_count}",
+        f"LIVE по трафику: {'🟢 онлайн' if vpn_name in live_users else '⚪ офлайн'}",
         "",
     ]
     for i, r in enumerate(rows, start=1):
