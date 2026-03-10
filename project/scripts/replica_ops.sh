@@ -3,7 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 NODES_ENV="${NODES_ENV:-$ROOT_DIR/env/nodes.env}"
-HC_SCRIPT="$ROOT_DIR/scripts/healthcheck_replica.sh"
+HC_SCRIPT_DEFAULT="$ROOT_DIR/scripts/healthcheck_replica.sh"
+HC_SCRIPT="${REPLICA_HC_CMD:-/usr/local/sbin/healthcheck-replica}"
 SSH_KEY_DEFAULT="/root/.ssh/vless_sync_ed25519"
 SSH_TIMEOUT=10
 NODE=""
@@ -65,6 +66,10 @@ done
 if [[ -f "$NODES_ENV" ]]; then
   # shellcheck disable=SC1090
   source "$NODES_ENV"
+fi
+
+if [[ ! -x "$HC_SCRIPT" ]]; then
+  HC_SCRIPT="$HC_SCRIPT_DEFAULT"
 fi
 
 SSH_KEY="${SSH_KEY:-$SSH_KEY_DEFAULT}"
@@ -132,4 +137,3 @@ case "$ACTION" in
     echo "Unknown action: $ACTION (expected diag|restart|postcheck|restart-post)" >&2
     exit 1 ;;
 esac
-
