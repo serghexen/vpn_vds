@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 import traceback
+import hashlib
 from threading import Thread
 import urllib.request
 from datetime import datetime, timezone
@@ -53,6 +54,9 @@ MONITOR_COOLDOWN_SEC = int(os.environ.get("MONITOR_COOLDOWN_SEC", "1800"))
 MONITOR_CMD = os.environ.get("MONITOR_CMD", "/usr/local/sbin/healthcheck-master-replicas")
 MONITOR_CHECK_USER = os.environ.get("MONITOR_CHECK_USER", "").strip()
 METRICS_CMD = os.environ.get("METRICS_CMD", "/usr/local/sbin/metrics-master-light")
+DEVICE_LOG_PATH = os.environ.get("DEVICE_LOG_PATH", "/var/log/nginx/sub_access.log")
+DEVICE_BOOTSTRAP_BYTES = int(os.environ.get("DEVICE_BOOTSTRAP_BYTES", str(2 * 1024 * 1024)))
+DEVICE_LIST_LIMIT = int(os.environ.get("DEVICE_LIST_LIMIT", "12"))
 ADMIN_TG_IDS = parse_int_set(os.environ.get("ADMIN_TG_IDS", ""))
 ADMIN_TG_USERNAMES = parse_str_set(os.environ.get("ADMIN_TG_USERNAMES", ""))
 PRIMARY_ADMIN_TG_ID = int(os.environ.get("PRIMARY_ADMIN_TG_ID", "227380225"))
@@ -89,6 +93,7 @@ CB_ADMIN_STATUS = "admin_status"
 CB_ADMIN_USERS = "admin_users"
 CB_ADMIN_ACCESS = "admin_access"
 CB_ADMIN_SERVICE = "admin_service"
+CB_ADMIN_DEVICES = "admin_devices"
 CB_ADMIN_CANCEL = "admin_cancel"
 CB_CONFIRM_BLOCK = "confirm_block"
 CB_CONFIRM_UNBLOCK = "confirm_unblock"
@@ -187,7 +192,190 @@ def init_db(conn: sqlite3.Connection):
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_devices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vpn_name TEXT NOT NULL,
+            device_key TEXT NOT NULL,
+            hwid TEXT NOT NULL DEFAULT '',
+            user_agent TEXT NOT NULL DEFAULT '',
+            ip TEXT NOT NULL DEFAULT '',
+            first_seen INTEGER NOT NULL,
+            last_seen INTEGER NOT NULL,
+            hits INTEGER NOT NULL DEFAULT 1,
+            last_path TEXT NOT NULL DEFAULT '',
+            UNIQUE(vpn_name, device_key)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS device_ingest_state (
+            log_path TEXT PRIMARY KEY,
+            inode INTEGER NOT NULL,
+            offset INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_user_devices_vpn_last ON user_devices(vpn_name, last_seen DESC)")
     conn.commit()
+
+
+def _safe_text(s: str, limit: int = 300):
+    t = (s or "").replace("\n", " ").replace("\r", " ").strip()
+    if len(t) > limit:
+        return t[: limit - 1] + "…"
+    return t
+
+
+def _fmt_ts(ts: int):
+    if ts <= 0:
+        return "-"
+    return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone().strftime("%d.%m.%Y %H:%M")
+
+
+def _resolve_vpn_name_by_sub_key(sub_key: str):
+    key = (sub_key or "").strip()
+    if not key:
+        return ""
+    for c in load_clients():
+        name = (c.get("name") or "").strip()
+        token = (c.get("token") or "").strip()
+        if key == name or key == token:
+            return name
+    return ""
+
+
+def _norm_field(raw: str):
+    s = (raw or "").strip()
+    if s in ("", "-", "null", "None"):
+        return ""
+    return s
+
+
+def _device_key(hwid: str, ua: str):
+    h = _norm_field(hwid)
+    if h:
+        return "hwid:" + h.lower()
+    ua_norm = _norm_field(ua).lower()
+    if not ua_norm:
+        return "unknown"
+    digest = hashlib.sha1(ua_norm.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return "ua:" + digest
+
+
+def ingest_device_log(conn: sqlite3.Connection):
+    p = Path(DEVICE_LOG_PATH)
+    if not p.exists():
+        return 0
+    try:
+        st = p.stat()
+    except Exception:
+        return 0
+
+    cur = conn.execute("SELECT inode, offset FROM device_ingest_state WHERE log_path=?", (str(p),))
+    row = cur.fetchone()
+    inode = int(st.st_ino)
+    size = int(st.st_size)
+    offset = 0
+    if row:
+        prev_inode = int(row[0] or 0)
+        prev_offset = int(row[1] or 0)
+        if prev_inode == inode and 0 <= prev_offset <= size:
+            offset = prev_offset
+    elif size > DEVICE_BOOTSTRAP_BYTES:
+        offset = size - DEVICE_BOOTSTRAP_BYTES
+
+    parsed = 0
+    now = int(time.time())
+    with p.open("r", encoding="utf-8", errors="ignore") as f:
+        if offset > 0:
+            f.seek(offset)
+        for line in f:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) < 9:
+                continue
+
+            try:
+                ts = int(float(parts[0]))
+            except Exception:
+                ts = now
+
+            ip = _norm_field(parts[1])
+            uri = _norm_field(parts[2])
+            ua = _norm_field(parts[3])
+            hwid = _norm_field(parts[4]) or _norm_field(parts[5]) or _norm_field(parts[6]) or _norm_field(parts[7]) or _norm_field(parts[8])
+
+            m = re.fullmatch(r"/sub/([A-Za-z0-9._-]+)", uri)
+            if not m:
+                continue
+            sub_key = m.group(1)
+            vpn_name = _resolve_vpn_name_by_sub_key(sub_key)
+            if not vpn_name:
+                continue
+
+            dkey = _device_key(hwid, ua)
+            conn.execute(
+                """
+                INSERT INTO user_devices (vpn_name, device_key, hwid, user_agent, ip, first_seen, last_seen, hits, last_path)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+                ON CONFLICT(vpn_name, device_key) DO UPDATE SET
+                    hwid=CASE WHEN excluded.hwid != '' THEN excluded.hwid ELSE user_devices.hwid END,
+                    user_agent=excluded.user_agent,
+                    ip=excluded.ip,
+                    last_seen=excluded.last_seen,
+                    hits=user_devices.hits + 1,
+                    last_path=excluded.last_path
+                """,
+                (vpn_name, dkey, hwid, ua, ip, ts, ts, uri),
+            )
+            parsed += 1
+
+        end_pos = f.tell()
+
+    conn.execute(
+        """
+        INSERT INTO device_ingest_state (log_path, inode, offset, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(log_path) DO UPDATE SET inode=excluded.inode, offset=excluded.offset, updated_at=excluded.updated_at
+        """,
+        (str(p), inode, int(end_pos), now),
+    )
+    conn.commit()
+    return parsed
+
+
+def get_device_stats_by_user(conn: sqlite3.Connection, limit: int = 20):
+    cur = conn.execute(
+        """
+        SELECT vpn_name, COUNT(*) AS devices, MAX(last_seen) AS last_seen
+        FROM user_devices
+        GROUP BY vpn_name
+        ORDER BY devices DESC, last_seen DESC
+        LIMIT ?
+        """,
+        (int(limit),),
+    )
+    return cur.fetchall()
+
+
+def get_devices_for_user(conn: sqlite3.Connection, vpn_name: str, limit: int = DEVICE_LIST_LIMIT):
+    cur = conn.execute(
+        """
+        SELECT device_key, hwid, user_agent, ip, first_seen, last_seen, hits
+        FROM user_devices
+        WHERE vpn_name=?
+        ORDER BY last_seen DESC
+        LIMIT ?
+        """,
+        (vpn_name, int(limit)),
+    )
+    return cur.fetchall()
 
 
 def get_user(conn: sqlite3.Connection, tg_id: int):
@@ -899,6 +1087,7 @@ def kb_admin_service():
     return {
         "inline_keyboard": [
             [{"text": "📊 Состояние узла", "callback_data": CB_ADMIN_STATUS}],
+            [{"text": "📱 Устройства", "callback_data": CB_ADMIN_DEVICES}],
             [{"text": "⬅️ Вернуться назад", "callback_data": CB_ADMIN}],
         ]
     }
@@ -1097,6 +1286,57 @@ def show_admin_status(msg: dict):
         send_message(chat_id, text, kb_admin())
 
 
+def show_admin_devices_overview(conn: sqlite3.Connection, msg: dict):
+    user = msg["from"]
+    chat_id = msg["chat"]["id"]
+    if not is_admin_user(user):
+        send_message(chat_id, "Эта команда только для администратора.", kb_main(is_admin=False))
+        return
+    try:
+        parsed = ingest_device_log(conn)
+    except Exception as e:
+        print(f"[device-ingest-error] {e}", file=sys.stderr, flush=True)
+        parsed = 0
+    rows = get_device_stats_by_user(conn, limit=12)
+    lines = [f"📱 Устройства (сбор без лимитов)\nОбновлено записей: {parsed}"]
+    if rows:
+        lines.append("")
+        lines.append("Топ пользователей по числу устройств:")
+        for i, r in enumerate(rows, start=1):
+            lines.append(f"{i}. {r[0]} — {int(r[1])} шт. (последняя активность: {_fmt_ts(int(r[2] or 0))})")
+    else:
+        lines.append("\nПока нет данных. Устройства появятся после запросов к /sub/*.")
+    lines.append("\nВыбери пользователя через «🔎 Поиск», чтобы посмотреть детали.")
+    send_message(chat_id, "\n".join(lines)[:3500], kb_admin_service())
+
+
+def show_admin_user_devices(conn: sqlite3.Connection, msg: dict, vpn_name: str):
+    chat_id = msg["chat"]["id"]
+    try:
+        ingest_device_log(conn)
+    except Exception as e:
+        print(f"[device-ingest-error] {e}", file=sys.stderr, flush=True)
+
+    rows = get_devices_for_user(conn, vpn_name, limit=DEVICE_LIST_LIMIT)
+    if not rows:
+        send_message(chat_id, f"📱 Устройства пользователя {vpn_name}\n\nДанных пока нет.", kb_admin_service())
+        return
+
+    lines = [f"📱 Устройства пользователя {vpn_name}", f"Показано: {len(rows)} (макс {DEVICE_LIST_LIMIT})", ""]
+    for i, r in enumerate(rows, start=1):
+        device_key, hwid, ua, ip, first_seen, last_seen, hits = r
+        ident = hwid or device_key
+        lines.append(f"{i}) ID: {_safe_text(ident, 48)}")
+        lines.append(f"Дата подключения: {_fmt_ts(int(last_seen or 0))}")
+        lines.append(f"Первый раз: {_fmt_ts(int(first_seen or 0))}")
+        if ip:
+            lines.append(f"IP: {ip}")
+        lines.append(f"User Agent: {_safe_text(ua, 180)}")
+        lines.append(f"Запросов: {int(hits or 0)}")
+        lines.append("")
+    send_message(chat_id, "\n".join(lines)[:3500], kb_admin_service())
+
+
 def start_select(conn: sqlite3.Connection, msg: dict, intent: str, query: str = "", offset: int = 0):
     tg_id = int(msg["from"]["id"])
     chat_id = msg["chat"]["id"]
@@ -1130,6 +1370,9 @@ def start_select(conn: sqlite3.Connection, msg: dict, intent: str, query: str = 
         can_choose = True
     elif intent == "trial_off":
         title = "Снять триал: выбери пользователя"
+        can_choose = True
+    elif intent == "devices":
+        title = "Устройства: выбери пользователя"
         can_choose = True
     else:
         title = "Удаление: выбери пользователя"
@@ -1374,6 +1617,10 @@ def handle_selector_callback(conn: sqlite3.Connection, msg: dict, action: str, s
             set_admin_state(conn, tg_id, STATE_TRIAL_OFF_CONFIRM, {"name": name})
             send_message(chat_id, f"Подтвердить снятие триала у пользователя {name}?", kb_confirm(CB_CONFIRM_TRIAL_OFF))
             return True
+        if intent == "devices":
+            clear_admin_state(conn, tg_id)
+            show_admin_user_devices(conn, msg, name)
+            return True
         if intent == "del":
             set_admin_state(conn, tg_id, STATE_DEL_CONFIRM, {"name": name})
             send_message(chat_id, f"Подтвердить удаление пользователя {name}?", kb_confirm(CB_CONFIRM_DELETE))
@@ -1448,6 +1695,12 @@ def dispatch_action(conn: sqlite3.Connection, msg: dict, action: str):
             send_message(chat_id, "Эта команда только для администратора.", kb_main(is_admin=False))
             return
         send_message(chat_id, "Раздел «Сервис».\nВыберите действие:", kb_admin_service())
+    elif action == CB_ADMIN_DEVICES:
+        if not is_admin_user(user):
+            send_message(chat_id, "Эта команда только для администратора.", kb_main(is_admin=False))
+            return
+        show_admin_devices_overview(conn, msg)
+        start_search(conn, msg, intent="devices")
     elif action == CB_ADMIN_CANCEL:
         clear_admin_state(conn, tg_id)
         show_admin(msg)

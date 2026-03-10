@@ -29,5 +29,6 @@ services:
       - /var/lib/hexenvpn-bot:/var/lib/hexenvpn-bot
       - /var/lib/vless-sub:/var/lib/vless-sub
       - /var/www/sub:/var/www/sub
+      - /var/log/nginx:/var/log/nginx:ro
       - /usr/local/etc/xray:/usr/local/etc/xray
       - /root/.ssh:/root/.ssh:ro
