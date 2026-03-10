@@ -50,6 +50,7 @@ services:
       - ./scripts/vless-del-user:/usr/local/sbin/vless-del-user:ro
       - ./scripts/vless-sync-expire:/usr/local/sbin/vless-sync-expire:ro
       - ./scripts/healthcheck_master_replicas.sh:/usr/local/sbin/healthcheck-master-replicas:ro
+      - ./scripts/healthcheck_replica.sh:/usr/local/sbin/healthcheck-replica:ro
       - ./scripts/metrics_master_light.sh:/usr/local/sbin/metrics-master-light:ro
       - ./runtime/bot:/var/lib/hexenvpn-bot
       - ./runtime/vless-sub:/var/lib/vless-sub

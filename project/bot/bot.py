@@ -55,6 +55,10 @@ MONITOR_INTERVAL_SEC = int(os.environ.get("MONITOR_INTERVAL_SEC", "300"))
 MONITOR_COOLDOWN_SEC = int(os.environ.get("MONITOR_COOLDOWN_SEC", "1800"))
 MONITOR_CMD = os.environ.get("MONITOR_CMD", "/usr/local/sbin/healthcheck-master-replicas")
 MONITOR_CHECK_USER = os.environ.get("MONITOR_CHECK_USER", "").strip()
+REPLICA_MONITOR_ENABLED = os.environ.get("REPLICA_MONITOR_ENABLED", "0").strip() == "1"
+REPLICA_MONITOR_INTERVAL_SEC = int(os.environ.get("REPLICA_MONITOR_INTERVAL_SEC", "300"))
+REPLICA_MONITOR_COOLDOWN_SEC = int(os.environ.get("REPLICA_MONITOR_COOLDOWN_SEC", "1800"))
+REPLICA_MONITOR_CMD = os.environ.get("REPLICA_MONITOR_CMD", "/usr/local/sbin/healthcheck-replica")
 METRICS_CMD = os.environ.get("METRICS_CMD", "/usr/local/sbin/metrics-master-light")
 DEVICE_LOG_PATH = os.environ.get("DEVICE_LOG_PATH", "/var/log/nginx/sub_access.log")
 DEVICE_BOOTSTRAP_BYTES = int(os.environ.get("DEVICE_BOOTSTRAP_BYTES", str(2 * 1024 * 1024)))
@@ -1457,6 +1461,62 @@ def monitor_loop():
         time.sleep(max(30, MONITOR_INTERVAL_SEC))
 
 
+def replica_monitor_loop():
+    if not REPLICA_MONITOR_ENABLED:
+        print("[replica-monitor] disabled", file=sys.stderr, flush=True)
+        return
+
+    nodes = []
+    if UK_HOST:
+        nodes.append(("uk", "UK", UK_HOST))
+    if TR_HOST:
+        nodes.append(("tr", "TR", TR_HOST))
+    if not nodes:
+        print("[replica-monitor] no replica hosts configured", file=sys.stderr, flush=True)
+        return
+
+    states = {code: {"was_bad": False, "last_bad_at": 0, "last_bad_sig": ""} for code, _label, _host in nodes}
+    print(
+        f"[replica-monitor] enabled interval={REPLICA_MONITOR_INTERVAL_SEC}s cooldown={REPLICA_MONITOR_COOLDOWN_SEC}s cmd={REPLICA_MONITOR_CMD}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+    while True:
+        try:
+            now = int(time.time())
+            for code, label, host in nodes:
+                st = states.setdefault(code, {"was_bad": False, "last_bad_at": 0, "last_bad_sig": ""})
+                args = [REPLICA_MONITOR_CMD, "--node", code]
+                if MONITOR_CHECK_USER:
+                    args += ["--user", MONITOR_CHECK_USER]
+                rc, out = run_cmd(args, timeout_sec=max(60, min(REPLICA_MONITOR_INTERVAL_SEC, 180)))
+                sig = f"{rc}:{(out or '')[:300]}"
+
+                if rc == 0:
+                    if st["was_bad"]:
+                        send_admin_alert(f"✅ Мониторинг реплики {label}: восстановлено ({host}).")
+                        print(f"[replica-monitor] recovered node={code}", file=sys.stderr, flush=True)
+                    st["was_bad"] = False
+                    continue
+
+                need_alert = (not st["was_bad"]) or (
+                    sig != st["last_bad_sig"] and (now - int(st["last_bad_at"] or 0)) >= REPLICA_MONITOR_COOLDOWN_SEC
+                )
+                if need_alert:
+                    msg = f"🚨 Мониторинг реплики {label}: проблема ({host}).\n\n" + (out[:2500] if out else f"rc={rc}")
+                    send_admin_alert(msg)
+                    st["last_bad_at"] = now
+                    st["last_bad_sig"] = sig
+                    print(f"[replica-monitor] alerted node={code}", file=sys.stderr, flush=True)
+                st["was_bad"] = True
+        except Exception as e:
+            print(f"[replica-monitor-loop-error] {e}", file=sys.stderr, flush=True)
+            traceback.print_exc()
+
+        time.sleep(max(30, REPLICA_MONITOR_INTERVAL_SEC))
+
+
 def trial_notice_loop():
     conn = sqlite3.connect(DB_PATH)
     init_db(conn)
@@ -2821,6 +2881,8 @@ def main_loop():
     worker.start()
     monitor = Thread(target=monitor_loop, daemon=True)
     monitor.start()
+    replica_monitor = Thread(target=replica_monitor_loop, daemon=True)
+    replica_monitor.start()
     trial_notifier = Thread(target=trial_notice_loop, daemon=True)
     trial_notifier.start()
     traffic_collector = Thread(target=traffic_collect_loop, daemon=True)

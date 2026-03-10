@@ -76,6 +76,11 @@ Bootstrap-скрипт:
 ## Операционный healthcheck и инциденты
 - Скрипт быстрой проверки master+replicas:
   - `project/scripts/healthcheck_master_replicas.sh`
+- Отдельная проверка конкретной реплики:
+  - `project/scripts/healthcheck_replica.sh --node uk`
+  - `project/scripts/healthcheck_replica.sh --node tr`
+- Быстрые ops-команды по реплике (диагностика/рестарт/postcheck):
+  - `project/scripts/replica_ops.sh --node uk --action restart-post`
 - Безопасный релиз на мастере (docker xray+bot + rollback):
   - `project/scripts/release_master.sh`
 - Backup/restore мастера:
@@ -96,6 +101,8 @@ Bootstrap-скрипт:
   - `project/docs/SIZING.md`
 - Короткий anti-incident runbook:
   - `project/docs/INCIDENT_2MIN.md`
+- Runbook «упала реплика UK/TR»:
+  - `project/docs/RUNBOOK_REPLICA_UK_TR.md`
 - TODO проекта:
   - `project/docs/TODO.md`
 - Фоновый мониторинг в Telegram (бот):

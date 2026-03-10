@@ -6,6 +6,7 @@
 - Скрипт метрик: `project/scripts/metrics_master_light.sh`
 - В админке бота: кнопка `📊 Состояние узла`
 - Команда бота: `/health` (только для админа)
+- Отдельный healthcheck реплик: `project/scripts/healthcheck_replica.sh`
 
 ## Какие метрики показывает
 - host, uptime
@@ -38,3 +39,25 @@ docker exec hexenvpn-bot sh -lc '/usr/local/sbin/metrics-master-light'
 Далее в Telegram:
 - открыть `🛠 Админка` -> `📊 Состояние узла`
 - или отправить `/health`
+
+## Отдельные алерты UK/TR (опционально)
+
+Если нужно получать отдельные уведомления по каждой реплике:
+
+1. В `project/env/bot.env` включить:
+```env
+REPLICA_MONITOR_ENABLED=1
+REPLICA_MONITOR_INTERVAL_SEC=300
+REPLICA_MONITOR_COOLDOWN_SEC=1800
+REPLICA_MONITOR_CMD=/usr/local/sbin/healthcheck-replica
+```
+
+2. Перезапустить бота:
+```bash
+docker compose -f project/docker-compose.master-full.yml up -d --no-deps --build bot
+```
+
+Бот будет отправлять отдельные алерты:
+- по UK;
+- по TR;
+- отдельные сообщения о восстановлении каждой реплики.
