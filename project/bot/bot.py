@@ -8,6 +8,7 @@ import sys
 import time
 import traceback
 import hashlib
+import html
 from threading import Thread
 import urllib.request
 from datetime import datetime, timezone
@@ -57,6 +58,7 @@ METRICS_CMD = os.environ.get("METRICS_CMD", "/usr/local/sbin/metrics-master-ligh
 DEVICE_LOG_PATH = os.environ.get("DEVICE_LOG_PATH", "/var/log/nginx/sub_access.log")
 DEVICE_BOOTSTRAP_BYTES = int(os.environ.get("DEVICE_BOOTSTRAP_BYTES", str(2 * 1024 * 1024)))
 DEVICE_LIST_LIMIT = int(os.environ.get("DEVICE_LIST_LIMIT", "12"))
+DEVICE_SOFT_LIMIT = int(os.environ.get("DEVICE_SOFT_LIMIT", "5"))
 ADMIN_TG_IDS = parse_int_set(os.environ.get("ADMIN_TG_IDS", ""))
 ADMIN_TG_USERNAMES = parse_str_set(os.environ.get("ADMIN_TG_USERNAMES", ""))
 PRIMARY_ADMIN_TG_ID = int(os.environ.get("PRIMARY_ADMIN_TG_ID", "227380225"))
@@ -214,6 +216,7 @@ def init_db(conn: sqlite3.Connection):
             last_seen INTEGER NOT NULL,
             hits INTEGER NOT NULL DEFAULT 1,
             revoked INTEGER NOT NULL DEFAULT 0,
+            pending INTEGER NOT NULL DEFAULT 0,
             last_path TEXT NOT NULL DEFAULT '',
             UNIQUE(vpn_name, device_key)
         )
@@ -245,8 +248,43 @@ def init_db(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE user_devices ADD COLUMN app_version TEXT NOT NULL DEFAULT ''")
     if "lang" not in cols:
         conn.execute("ALTER TABLE user_devices ADD COLUMN lang TEXT NOT NULL DEFAULT ''")
+    if "pending" not in cols:
+        conn.execute("ALTER TABLE user_devices ADD COLUMN pending INTEGER NOT NULL DEFAULT 0")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_user_devices_vpn_last ON user_devices(vpn_name, last_seen DESC)")
     conn.commit()
+
+
+def count_active_devices(conn: sqlite3.Connection, vpn_name: str):
+    cur = conn.execute(
+        "SELECT COUNT(*) FROM user_devices WHERE vpn_name=? AND revoked=0 AND pending=0",
+        (vpn_name,),
+    )
+    row = cur.fetchone()
+    return int((row or [0])[0] or 0)
+
+
+def promote_pending_devices(conn: sqlite3.Connection, vpn_name: str):
+    slots = DEVICE_SOFT_LIMIT - count_active_devices(conn, vpn_name)
+    if slots <= 0:
+        return 0
+    cur = conn.execute(
+        """
+        SELECT device_key
+        FROM user_devices
+        WHERE vpn_name=? AND revoked=0 AND pending=1
+        ORDER BY last_seen DESC
+        LIMIT ?
+        """,
+        (vpn_name, int(slots)),
+    )
+    keys = [str(r[0]) for r in cur.fetchall() if r and r[0]]
+    if not keys:
+        return 0
+    conn.executemany(
+        "UPDATE user_devices SET pending=0 WHERE vpn_name=? AND device_key=?",
+        [(vpn_name, k) for k in keys],
+    )
+    return len(keys)
 
 
 def _safe_text(s: str, limit: int = 300):
@@ -405,10 +443,24 @@ def ingest_device_log(conn: sqlite3.Connection):
                 os_version=os_version,
                 device_model=device_model,
             )
+            existing = conn.execute(
+                "SELECT revoked, pending FROM user_devices WHERE vpn_name=? AND device_key=?",
+                (vpn_name, dkey),
+            ).fetchone()
+            pending = 0
+            if existing:
+                was_pending = int(existing[1] or 0) == 1
+                was_revoked = int(existing[0] or 0) == 1
+                if was_pending:
+                    pending = 1
+                elif was_revoked and count_active_devices(conn, vpn_name) >= DEVICE_SOFT_LIMIT:
+                    pending = 1
+            elif count_active_devices(conn, vpn_name) >= DEVICE_SOFT_LIMIT:
+                pending = 1
             conn.execute(
                 """
-                INSERT INTO user_devices (vpn_name, device_key, hwid, user_agent, ip, platform, os_name, os_version, device_model, app_version, lang, first_seen, last_seen, hits, last_path)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                INSERT INTO user_devices (vpn_name, device_key, hwid, user_agent, ip, platform, os_name, os_version, device_model, app_version, lang, first_seen, last_seen, hits, revoked, pending, last_path)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)
                 ON CONFLICT(vpn_name, device_key) DO UPDATE SET
                     hwid=CASE WHEN excluded.hwid != '' THEN excluded.hwid ELSE user_devices.hwid END,
                     user_agent=excluded.user_agent,
@@ -422,9 +474,10 @@ def ingest_device_log(conn: sqlite3.Connection):
                     last_seen=excluded.last_seen,
                     hits=user_devices.hits + 1,
                     revoked=0,
+                    pending=excluded.pending,
                     last_path=excluded.last_path
                 """,
-                (vpn_name, dkey, hwid, ua, ip, platform, os_name, os_version, device_model, app_version, lang, ts, ts, uri),
+                (vpn_name, dkey, hwid, ua, ip, platform, os_name, os_version, device_model, app_version, lang, ts, ts, pending, uri),
             )
             parsed += 1
 
@@ -445,11 +498,15 @@ def ingest_device_log(conn: sqlite3.Connection):
 def get_device_stats_by_user(conn: sqlite3.Connection, limit: int = 20):
     cur = conn.execute(
         """
-        SELECT vpn_name, COUNT(*) AS devices, MAX(last_seen) AS last_seen
+        SELECT
+          vpn_name,
+          SUM(CASE WHEN revoked=0 AND pending=0 THEN 1 ELSE 0 END) AS active_devices,
+          SUM(CASE WHEN revoked=0 AND pending=1 THEN 1 ELSE 0 END) AS pending_devices,
+          MAX(last_seen) AS last_seen
         FROM user_devices
-        WHERE revoked=0
         GROUP BY vpn_name
-        ORDER BY devices DESC, last_seen DESC
+        HAVING active_devices > 0 OR pending_devices > 0
+        ORDER BY active_devices DESC, pending_devices DESC, last_seen DESC
         LIMIT ?
         """,
         (int(limit),),
@@ -460,10 +517,10 @@ def get_device_stats_by_user(conn: sqlite3.Connection, limit: int = 20):
 def get_devices_for_user(conn: sqlite3.Connection, vpn_name: str, limit: int = DEVICE_LIST_LIMIT):
     cur = conn.execute(
         """
-        SELECT device_key, hwid, user_agent, ip, platform, os_name, os_version, device_model, app_version, lang, first_seen, last_seen, hits
+        SELECT device_key, hwid, user_agent, ip, platform, os_name, os_version, device_model, app_version, lang, first_seen, last_seen, hits, pending
         FROM user_devices
         WHERE vpn_name=? AND revoked=0
-        ORDER BY last_seen DESC
+        ORDER BY pending ASC, last_seen DESC
         LIMIT ?
         """,
         (vpn_name, int(limit)),
@@ -474,10 +531,10 @@ def get_devices_for_user(conn: sqlite3.Connection, vpn_name: str, limit: int = D
 def get_all_devices_for_user(conn: sqlite3.Connection, vpn_name: str, limit: int = 200):
     cur = conn.execute(
         """
-        SELECT device_key, hwid, user_agent, ip, platform, os_name, os_version, device_model, app_version, lang, first_seen, last_seen, hits
+        SELECT device_key, hwid, user_agent, ip, platform, os_name, os_version, device_model, app_version, lang, first_seen, last_seen, hits, pending
         FROM user_devices
         WHERE vpn_name=? AND revoked=0
-        ORDER BY last_seen DESC
+        ORDER BY pending ASC, last_seen DESC
         LIMIT ?
         """,
         (vpn_name, int(limit)),
@@ -498,9 +555,10 @@ def revoke_device_by_token(conn: sqlite3.Connection, vpn_name: str, token: str):
                 "UPDATE user_devices SET revoked=1 WHERE vpn_name=? AND device_key=?",
                 (vpn_name, dkey),
             )
+            promoted = promote_pending_devices(conn, vpn_name)
             conn.commit()
-            return True
-    return False
+            return True, promoted
+    return False, 0
 
 
 def revoke_all_devices(conn: sqlite3.Connection, vpn_name: str):
@@ -508,8 +566,9 @@ def revoke_all_devices(conn: sqlite3.Connection, vpn_name: str):
         "UPDATE user_devices SET revoked=1 WHERE vpn_name=? AND revoked=0",
         (vpn_name,),
     )
+    promoted = promote_pending_devices(conn, vpn_name)
     conn.commit()
-    return int(cur.rowcount or 0)
+    return int(cur.rowcount or 0), promoted
 
 
 def device_line_label(idx: int, hwid: str, ua: str):
@@ -1221,7 +1280,9 @@ def kb_my_devices(vpn_name: str, rows: list[tuple]):
     for idx, r in enumerate(rows, start=1):
         dkey = (r[0] or "")
         tok = device_action_token(vpn_name, dkey)
-        label = "❌ Отвязать " + device_line_label(idx, (r[1] or ""), (r[2] or ""))
+        ident = human_device_id(dkey, (r[1] or ""))
+        ident_short = _safe_text(ident, 18)
+        label = f"Отключить {ident_short} ({idx})"
         buttons.append([{"text": label[:62], "callback_data": f"{CB_MY_DEVICE_REVOKE_PREFIX}{tok}"}])
     if rows:
         buttons.append([{"text": "♻️ Отвязать все", "callback_data": CB_MY_DEVICE_REVOKE_ALL}])
@@ -1473,26 +1534,25 @@ def show_my_devices(conn: sqlite3.Connection, msg: dict):
             kb_my_devices(vpn_name, []),
         )
         return
-    lines = [f"📱 Мои устройства ({len(rows)})", ""]
+    active_count = sum(1 for r in rows if int((r[13] if len(r) > 13 else 0) or 0) == 0)
+    lines = [
+        "📱 Мои устройства:",
+        f"Список устройств ({active_count}/{DEVICE_SOFT_LIMIT})",
+    ]
+    lines.append("")
     for i, r in enumerate(rows, start=1):
-        device_key, hwid, ua, ip, platform, os_name, os_version, device_model, app_version, lang, first_seen, last_seen, hits = r
+        device_key, hwid, ua, ip, platform, os_name, os_version, device_model, app_version, lang, first_seen, last_seen, hits, pending = r
         ident = human_device_id(device_key, hwid)
         title = human_device_title(platform, os_name, os_version, device_model, ua)
-        lines.append(f"{i}) ID: {_safe_text(ident, 40)}")
-        if title:
-            lines.append(f"Устройство: {_safe_text(title, 100)}")
-        lines.append(f"Последняя активность: {_fmt_ts(int(last_seen or 0))}")
-        lines.append(f"Первый раз: {_fmt_ts(int(first_seen or 0))}")
-        if ip:
-            lines.append(f"IP: {ip}")
-        if app_version:
-            lines.append(f"App: {_safe_text(app_version, 60)}")
-        if lang:
-            lines.append(f"Lang: {_safe_text(lang, 30)}")
-        lines.append(f"User Agent: {_safe_text(ua, 140)}")
-        lines.append(f"Запросов: {int(hits or 0)}")
+        name = title or f"Устройство {i}"
+        lines.append(f"<b>{html.escape(_safe_text(name, 100))}</b>")
+        lines.append(f"Дата подключения: {_fmt_ts(int(last_seen or 0))}")
+        lines.append(f"User Agent: {html.escape(_safe_text(ua, 140))}")
+        lines.append(f"HWID: {html.escape(_safe_text(ident, 40))}")
+        if int(pending or 0) == 1:
+            lines.append("Статус: ⏳ Ожидает активации (освободите слот)")
         lines.append("")
-    send_message(chat_id, "\n".join(lines)[:3500], kb_my_devices(vpn_name, rows))
+    send_message(chat_id, "\n".join(lines)[:3500], kb_my_devices(vpn_name, rows), parse_mode="HTML")
 
 
 def show_pay(msg: dict):
@@ -1578,7 +1638,10 @@ def show_admin_devices_overview(conn: sqlite3.Connection, msg: dict):
                 who = f"{disp} ({vpn_name})"
             else:
                 who = vpn_name
-            lines.append(f"{i}. {who} — {int(r[1])} шт. (последняя активность: {_fmt_ts(int(r[2] or 0))})")
+            lines.append(
+                f"{i}. {who} — активных {int(r[1] or 0)}, в ожидании {int(r[2] or 0)} "
+                f"(последняя активность: {_fmt_ts(int(r[3] or 0))})"
+            )
     else:
         lines.append("\nПока нет данных. Устройства появятся после запросов к /sub/*.")
     lines.append("\nВыбери пользователя через «🔎 Поиск», чтобы посмотреть детали.")
@@ -1602,14 +1665,22 @@ def show_admin_user_devices(conn: sqlite3.Connection, msg: dict, vpn_name: str):
         send_message(chat_id, f"📱 Устройства пользователя {header_user}\n\nДанных пока нет.", kb_admin_service())
         return
 
-    lines = [f"📱 Устройства пользователя {header_user}", f"Показано: {len(rows)} (макс {DEVICE_LIST_LIMIT})", ""]
+    active_count = sum(1 for r in rows if int((r[13] if len(r) > 13 else 0) or 0) == 0)
+    pending_count = sum(1 for r in rows if int((r[13] if len(r) > 13 else 0) or 0) == 1)
+    lines = [
+        f"📱 Устройства пользователя {header_user}",
+        f"Показано: {len(rows)} (макс {DEVICE_LIST_LIMIT})",
+        f"Активных: {active_count}/{DEVICE_SOFT_LIMIT}, в ожидании: {pending_count}",
+        "",
+    ]
     for i, r in enumerate(rows, start=1):
-        device_key, hwid, ua, ip, platform, os_name, os_version, device_model, app_version, lang, first_seen, last_seen, hits = r
+        device_key, hwid, ua, ip, platform, os_name, os_version, device_model, app_version, lang, first_seen, last_seen, hits, pending = r
         ident = human_device_id(device_key, hwid)
         title = human_device_title(platform, os_name, os_version, device_model, ua)
         lines.append(f"{i}) ID: {_safe_text(ident, 48)}")
         if title:
             lines.append(f"Устройство: {_safe_text(title, 120)}")
+        lines.append(f"Статус: {'⏳ Ожидает активации' if int(pending or 0) == 1 else '✅ Активно'}")
         lines.append(f"Дата подключения: {_fmt_ts(int(last_seen or 0))}")
         lines.append(f"Первый раз: {_fmt_ts(int(first_seen or 0))}")
         if ip:
@@ -1950,8 +2021,9 @@ def dispatch_action(conn: sqlite3.Connection, msg: dict, action: str):
             send_message(chat_id, "Подписка не найдена. Нажми /start", kb_main(is_admin=is_admin_user(user)))
             return
         vpn_name = row[2]
-        n = revoke_all_devices(conn, vpn_name)
-        send_message(chat_id, f"✅ Отвязано устройств: {n}", kb_main(is_admin=is_admin_user(user)))
+        n, promoted = revoke_all_devices(conn, vpn_name)
+        extra = f"\nАктивировано из ожидания: {promoted}" if promoted > 0 else ""
+        send_message(chat_id, f"✅ Отвязано устройств: {n}{extra}", kb_main(is_admin=is_admin_user(user)))
     elif action.startswith(CB_MY_DEVICE_REVOKE_PREFIX):
         clear_admin_state(conn, tg_id)
         row = get_user(conn, tg_id)
@@ -1960,9 +2032,10 @@ def dispatch_action(conn: sqlite3.Connection, msg: dict, action: str):
             return
         vpn_name = row[2]
         token = action[len(CB_MY_DEVICE_REVOKE_PREFIX):].strip()
-        ok = revoke_device_by_token(conn, vpn_name, token)
+        ok, promoted = revoke_device_by_token(conn, vpn_name, token)
         if ok:
-            send_message(chat_id, "✅ Устройство отвязано.", kb_main(is_admin=is_admin_user(user)))
+            extra = f"\nАктивировано из ожидания: {promoted}" if promoted > 0 else ""
+            send_message(chat_id, f"✅ Устройство отвязано.{extra}", kb_main(is_admin=is_admin_user(user)))
         else:
             send_message(chat_id, "⚠️ Устройство не найдено или уже отвязано.", kb_main(is_admin=is_admin_user(user)))
     elif action in (CB_PAY, "Оплатить подписку", "💰 Оплатить подписку"):
