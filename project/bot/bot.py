@@ -1855,7 +1855,11 @@ def show_admin_devices_overview(conn: sqlite3.Connection, msg: dict, force_live:
     rows = get_device_stats_by_user(conn, limit=12)
     online_total = online_users_count(conn)
     live = get_live_online_snapshot(force=force_live)
-    live_users = live.get("all_users") or set()
+    live_users_raw = live.get("all_users") or set()
+    live_users = set()
+    for u in live_users_raw:
+        live_users.add(u)
+        live_users.add(canonical_vpn_name(conn, u))
     lines = [
         f"📱 Устройства (сбор без лимитов)",
         f"Обновлено записей: {parsed}",
@@ -1902,7 +1906,11 @@ def show_admin_user_devices(conn: sqlite3.Connection, msg: dict, vpn_name: str):
 
     rows = get_devices_for_user(conn, vpn_name, limit=DEVICE_LIST_LIMIT)
     live = get_live_online_snapshot(force=False)
-    live_users = live.get("all_users") or set()
+    live_users_raw = live.get("all_users") or set()
+    live_users = set()
+    for u in live_users_raw:
+        live_users.add(u)
+        live_users.add(canonical_vpn_name(conn, u))
     disp = display_name_for(conn, vpn_name) or vpn_name
     if disp != vpn_name:
         header_user = f"{disp} ({vpn_name})"
