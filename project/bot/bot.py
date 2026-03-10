@@ -250,8 +250,49 @@ def init_db(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE user_devices ADD COLUMN lang TEXT NOT NULL DEFAULT ''")
     if "pending" not in cols:
         conn.execute("ALTER TABLE user_devices ADD COLUMN pending INTEGER NOT NULL DEFAULT 0")
+    normalize_tg_alias_devices(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_user_devices_vpn_last ON user_devices(vpn_name, last_seen DESC)")
     conn.commit()
+
+
+def canonical_vpn_name(conn: sqlite3.Connection, vpn_name: str):
+    name = (vpn_name or "").strip()
+    m = re.fullmatch(r"tg_(\d+)", name)
+    if not m:
+        return name
+    try:
+        tg_id = int(m.group(1))
+    except Exception:
+        return name
+    cur = conn.execute("SELECT vpn_name FROM tg_users WHERE tg_id=? LIMIT 1", (tg_id,))
+    row = cur.fetchone()
+    mapped = ((row or [""])[0] or "").strip()
+    return mapped or name
+
+
+def normalize_tg_alias_devices(conn: sqlite3.Connection):
+    rows = conn.execute("SELECT tg_id, vpn_name FROM tg_users").fetchall()
+    moved = 0
+    for tg_id, canonical in rows:
+        canonical = (canonical or "").strip()
+        if not canonical:
+            continue
+        alias = f"tg_{int(tg_id)}"
+        if alias == canonical:
+            continue
+        conn.execute(
+            """
+            DELETE FROM user_devices
+            WHERE vpn_name=? AND device_key IN (
+                SELECT device_key FROM user_devices WHERE vpn_name=?
+            )
+            """,
+            (alias, canonical),
+        )
+        cur = conn.execute("UPDATE user_devices SET vpn_name=? WHERE vpn_name=?", (canonical, alias))
+        moved += int(cur.rowcount or 0)
+    if moved > 0:
+        print(f"[devices-normalize] moved={moved}", file=sys.stderr, flush=True)
 
 
 def count_active_devices(conn: sqlite3.Connection, vpn_name: str):
@@ -431,6 +472,7 @@ def ingest_device_log(conn: sqlite3.Connection):
             vpn_name = _resolve_vpn_name_by_sub_key(sub_key)
             if not vpn_name:
                 continue
+            vpn_name = canonical_vpn_name(conn, vpn_name)
 
             dkey = _device_key(
                 hwid=hwid,
