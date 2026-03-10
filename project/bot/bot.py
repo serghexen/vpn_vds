@@ -119,6 +119,8 @@ CB_ADMIN_ONLINE = "admin_online"
 CB_ADMIN_TRAFFIC = "admin_traffic"
 CB_ADMIN_TRAFFIC_PICK = "admin_traffic_pick"
 CB_ADMIN_TRAFFIC_REFRESH = "admin_traffic_refresh"
+CB_ADMIN_DIAG_UK = "admin_diag_uk"
+CB_ADMIN_DIAG_TR = "admin_diag_tr"
 CB_ADMIN_RESTART_UK = "admin_restart_uk"
 CB_ADMIN_RESTART_TR = "admin_restart_tr"
 CB_ADMIN_CANCEL = "admin_cancel"
@@ -1915,6 +1917,10 @@ def kb_admin_service():
             ],
             [{"text": "📊 Трафик (24ч)", "callback_data": CB_ADMIN_TRAFFIC}],
             [
+                {"text": "🔍 Диаг UK", "callback_data": CB_ADMIN_DIAG_UK},
+                {"text": "🔍 Диаг TR", "callback_data": CB_ADMIN_DIAG_TR},
+            ],
+            [
                 {"text": "🔁 Рестарт UK", "callback_data": CB_ADMIN_RESTART_UK},
                 {"text": "🔁 Рестарт TR", "callback_data": CB_ADMIN_RESTART_TR},
             ],
@@ -2856,6 +2862,30 @@ def dispatch_action(conn: sqlite3.Connection, msg: dict, action: str):
             return
         clear_admin_state(conn, tg_id)
         show_admin_traffic(conn, msg, hours=24)
+    elif action == CB_ADMIN_DIAG_UK:
+        if not is_admin_user(user):
+            send_message(chat_id, "Эта команда только для администратора.", kb_main(is_admin=False))
+            return
+        args = [REPLICA_OPS_CMD, "--node", "uk", "--action", "diag"]
+        if MONITOR_CHECK_USER:
+            args += ["--user", MONITOR_CHECK_USER]
+        rc, out = run_cmd(args, timeout_sec=120)
+        if rc == 0:
+            send_message(chat_id, f"✅ Диагностика UK: OK\n\n{(out or '')[:2500]}", kb_admin_service())
+        else:
+            send_message(chat_id, f"❌ Диагностика UK: FAIL\n\n{(out or '')[:2500]}", kb_admin_service())
+    elif action == CB_ADMIN_DIAG_TR:
+        if not is_admin_user(user):
+            send_message(chat_id, "Эта команда только для администратора.", kb_main(is_admin=False))
+            return
+        args = [REPLICA_OPS_CMD, "--node", "tr", "--action", "diag"]
+        if MONITOR_CHECK_USER:
+            args += ["--user", MONITOR_CHECK_USER]
+        rc, out = run_cmd(args, timeout_sec=120)
+        if rc == 0:
+            send_message(chat_id, f"✅ Диагностика TR: OK\n\n{(out or '')[:2500]}", kb_admin_service())
+        else:
+            send_message(chat_id, f"❌ Диагностика TR: FAIL\n\n{(out or '')[:2500]}", kb_admin_service())
     elif action == CB_ADMIN_RESTART_UK:
         if not is_admin_user(user):
             send_message(chat_id, "Эта команда только для администратора.", kb_main(is_admin=False))
