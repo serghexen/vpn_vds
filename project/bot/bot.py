@@ -107,6 +107,7 @@ CB_ADMIN_ACCESS = "admin_access"
 CB_ADMIN_SERVICE = "admin_service"
 CB_ADMIN_DEVICES = "admin_devices"
 CB_ADMIN_DEVICES_REFRESH = "admin_devices_refresh"
+CB_ADMIN_ONLINE = "admin_online"
 CB_ADMIN_CANCEL = "admin_cancel"
 CB_CONFIRM_BLOCK = "confirm_block"
 CB_CONFIRM_UNBLOCK = "confirm_unblock"
@@ -729,6 +730,37 @@ def get_device_stats_by_user(conn: sqlite3.Connection, limit: int = 20):
         (int(limit),),
     )
     return cur.fetchall()
+
+
+def get_device_counts_map(conn: sqlite3.Connection):
+    cur = conn.execute(
+        """
+        SELECT
+          vpn_name,
+          SUM(CASE WHEN revoked=0 AND pending=0 THEN 1 ELSE 0 END) AS active_devices,
+          SUM(CASE WHEN revoked=0 AND pending=1 THEN 1 ELSE 0 END) AS pending_devices
+        FROM user_devices
+        GROUP BY vpn_name
+        """
+    )
+    out = {}
+    for r in cur.fetchall():
+        out[(r[0] or "").strip()] = (int(r[1] or 0), int(r[2] or 0))
+    return out
+
+
+def get_latest_device_for_user(conn: sqlite3.Connection, vpn_name: str):
+    cur = conn.execute(
+        """
+        SELECT device_key, hwid, user_agent, platform, os_name, os_version, device_model, app_version, last_seen
+        FROM user_devices
+        WHERE vpn_name=? AND revoked=0
+        ORDER BY pending ASC, last_seen DESC
+        LIMIT 1
+        """,
+        (vpn_name,),
+    )
+    return cur.fetchone()
 
 
 def get_devices_for_user(conn: sqlite3.Connection, vpn_name: str, limit: int = DEVICE_LIST_LIMIT):
@@ -1594,8 +1626,9 @@ def kb_admin_service():
             [{"text": "📊 Состояние узла", "callback_data": CB_ADMIN_STATUS}],
             [
                 {"text": "📱 Устройства", "callback_data": CB_ADMIN_DEVICES},
-                {"text": "🔄 Обновить", "callback_data": CB_ADMIN_DEVICES_REFRESH},
+                {"text": "🟢 Онлайн сессии", "callback_data": CB_ADMIN_ONLINE},
             ],
+            [{"text": "🔄 Обновить", "callback_data": CB_ADMIN_DEVICES_REFRESH}],
             [{"text": "⬅️ Вернуться назад", "callback_data": CB_ADMIN}],
         ]
     }
@@ -1623,7 +1656,7 @@ def kb_selector(rows: list[dict], offset: int, total: int, can_choose: bool):
     buttons = []
     if can_choose:
         for r in rows:
-            label = f"{r['status']} {r['display']} | {r['exp_txt']}"
+            label = r.get("label") or f"{r['status']} {r['display']} | {r['exp_txt']}"
             buttons.append([{"text": label[:60], "callback_data": f"{CB_SEL_USER_PREFIX}{r['name']}"}])
     nav = []
     if offset > 0:
@@ -1897,6 +1930,47 @@ def show_admin_devices_overview(conn: sqlite3.Connection, msg: dict, force_live:
     send_message(chat_id, "\n".join(lines)[:3500], kb_admin_service())
 
 
+def show_admin_online_sessions(conn: sqlite3.Connection, msg: dict, force_live: bool = False):
+    user = msg["from"]
+    chat_id = msg["chat"]["id"]
+    if not is_admin_user(user):
+        send_message(chat_id, "Эта команда только для администратора.", kb_main(is_admin=False))
+        return
+    try:
+        ingest_device_log(conn)
+    except Exception as e:
+        print(f"[device-ingest-error] {e}", file=sys.stderr, flush=True)
+    live = get_live_online_snapshot(force=force_live)
+    if not live.get("enabled"):
+        send_message(chat_id, "🟢 Онлайн сессии\n\nLIVE мониторинг отключен.", kb_admin_service())
+        return
+
+    lines = ["🟢 Онлайн сессии", f"Окно детекции: {LIVE_ONLINE_SAMPLE_SEC} сек", ""]
+    total_live = len(live.get("all_users") or set())
+    lines.append(f"Всего активных аккаунтов: {total_live}")
+
+    nodes = live.get("nodes") or {}
+    for node_name, rec in nodes.items():
+        if not rec.get("ok"):
+            lines.append(f"\n{node_name}: n/a")
+            continue
+        users = sorted(rec.get("users") or set())
+        lines.append(f"\n{node_name}: {len(users)}")
+        for uname in users[:20]:
+            canon = canonical_vpn_name(conn, uname)
+            disp = display_name_for(conn, canon) or canon
+            who = f"{disp} ({canon})" if disp != canon else canon
+            d = get_latest_device_for_user(conn, canon)
+            if d:
+                dkey, hwid, ua, platform, os_name, os_version, device_model, app_ver, _last_seen = d
+                title = human_device_title(platform, os_name, os_version, device_model, ua) or "Устройство"
+                ident = human_device_id(dkey, hwid)
+                lines.append(f"- {who} | { _safe_text(title, 48) } | { _safe_text(ident, 24) }")
+            else:
+                lines.append(f"- {who} | устройство: n/a")
+    send_message(chat_id, "\n".join(lines)[:3500], kb_admin_service())
+
+
 def show_admin_user_devices(conn: sqlite3.Connection, msg: dict, vpn_name: str):
     chat_id = msg["chat"]["id"]
     try:
@@ -1962,6 +2036,17 @@ def start_select(conn: sqlite3.Connection, msg: dict, intent: str, query: str = 
     elif intent == "trial_off":
         filter_mode = "only_trial"
     rows = build_user_rows(conn, query=query, filter_mode=filter_mode)
+    if intent == "devices":
+        counts = get_device_counts_map(conn)
+        for r in rows:
+            n = r.get("name", "")
+            active, pending = counts.get(n, (0, 0))
+            r["devices_active"] = active
+            r["devices_pending"] = pending
+            suffix = f"{active}"
+            if pending > 0:
+                suffix += f" (+{pending})"
+            r["label"] = f"{r['display']} | устройств: {suffix}"
     if offset < 0:
         offset = 0
     if offset >= len(rows):
@@ -1995,7 +2080,15 @@ def start_select(conn: sqlite3.Connection, msg: dict, intent: str, query: str = 
     q_txt = f"\nФильтр: {query}" if query else ""
     line_items = []
     for i, r in enumerate(page, start=offset + 1):
-        line_items.append(f"{i}. {r['display']} | {r['exp_txt']} | {r['status']}")
+        if intent == "devices":
+            active = int(r.get("devices_active") or 0)
+            pending = int(r.get("devices_pending") or 0)
+            suffix = f"{active}"
+            if pending > 0:
+                suffix += f" (+{pending})"
+            line_items.append(f"{i}. {r['display']} | устройств: {suffix}")
+        else:
+            line_items.append(f"{i}. {r['display']} | {r['exp_txt']} | {r['status']}")
     body = "\n".join(line_items) if line_items else "(пусто)"
     text = f"{title}\nВсего: {len(rows)}{q_txt}\n\n{body}"
     send_message(chat_id, text, kb_selector(page, offset, len(rows), can_choose=can_choose))
@@ -2340,14 +2433,27 @@ def dispatch_action(conn: sqlite3.Connection, msg: dict, action: str):
         if not is_admin_user(user):
             send_message(chat_id, "Эта команда только для администратора.", kb_main(is_admin=False))
             return
-        show_admin_devices_overview(conn, msg)
-        start_search(conn, msg, intent="devices")
+        try:
+            ingest_device_log(conn)
+        except Exception as e:
+            print(f"[device-ingest-error] {e}", file=sys.stderr, flush=True)
+        start_select(conn, msg, intent="devices", query="", offset=0)
     elif action == CB_ADMIN_DEVICES_REFRESH:
         if not is_admin_user(user):
             send_message(chat_id, "Эта команда только для администратора.", kb_main(is_admin=False))
             return
         clear_admin_state(conn, tg_id)
-        show_admin_devices_overview(conn, msg, force_live=True)
+        try:
+            ingest_device_log(conn)
+        except Exception as e:
+            print(f"[device-ingest-error] {e}", file=sys.stderr, flush=True)
+        start_select(conn, msg, intent="devices", query="", offset=0)
+    elif action == CB_ADMIN_ONLINE:
+        if not is_admin_user(user):
+            send_message(chat_id, "Эта команда только для администратора.", kb_main(is_admin=False))
+            return
+        clear_admin_state(conn, tg_id)
+        show_admin_online_sessions(conn, msg, force_live=True)
     elif action == CB_ADMIN_CANCEL:
         clear_admin_state(conn, tg_id)
         show_admin(msg)
