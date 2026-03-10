@@ -103,6 +103,9 @@ CB_SEL_PREV = "sel_prev"
 CB_SEL_NEXT = "sel_next"
 CB_SEL_FIND = "sel_find"
 CB_SEL_USER_PREFIX = "sel_user:"
+CB_MY_DEVICES = "my_devices"
+CB_MY_DEVICE_REVOKE_ALL = "mydev_del_all"
+CB_MY_DEVICE_REVOKE_PREFIX = "mydev_del:"
 
 STATE_ADD_NAME = "add_name"
 STATE_ADD_DAYS = "add_days"
@@ -204,6 +207,7 @@ def init_db(conn: sqlite3.Connection):
             first_seen INTEGER NOT NULL,
             last_seen INTEGER NOT NULL,
             hits INTEGER NOT NULL DEFAULT 1,
+            revoked INTEGER NOT NULL DEFAULT 0,
             last_path TEXT NOT NULL DEFAULT '',
             UNIQUE(vpn_name, device_key)
         )
@@ -219,6 +223,10 @@ def init_db(conn: sqlite3.Connection):
         )
         """
     )
+    # lightweight migration for existing DBs
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(user_devices)").fetchall()]
+    if "revoked" not in cols:
+        conn.execute("ALTER TABLE user_devices ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_user_devices_vpn_last ON user_devices(vpn_name, last_seen DESC)")
     conn.commit()
 
@@ -330,6 +338,7 @@ def ingest_device_log(conn: sqlite3.Connection):
                     ip=excluded.ip,
                     last_seen=excluded.last_seen,
                     hits=user_devices.hits + 1,
+                    revoked=0,
                     last_path=excluded.last_path
                 """,
                 (vpn_name, dkey, hwid, ua, ip, ts, ts, uri),
@@ -355,6 +364,7 @@ def get_device_stats_by_user(conn: sqlite3.Connection, limit: int = 20):
         """
         SELECT vpn_name, COUNT(*) AS devices, MAX(last_seen) AS last_seen
         FROM user_devices
+        WHERE revoked=0
         GROUP BY vpn_name
         ORDER BY devices DESC, last_seen DESC
         LIMIT ?
@@ -369,13 +379,64 @@ def get_devices_for_user(conn: sqlite3.Connection, vpn_name: str, limit: int = D
         """
         SELECT device_key, hwid, user_agent, ip, first_seen, last_seen, hits
         FROM user_devices
-        WHERE vpn_name=?
+        WHERE vpn_name=? AND revoked=0
         ORDER BY last_seen DESC
         LIMIT ?
         """,
         (vpn_name, int(limit)),
     )
     return cur.fetchall()
+
+
+def get_all_devices_for_user(conn: sqlite3.Connection, vpn_name: str, limit: int = 200):
+    cur = conn.execute(
+        """
+        SELECT device_key, hwid, user_agent, ip, first_seen, last_seen, hits
+        FROM user_devices
+        WHERE vpn_name=? AND revoked=0
+        ORDER BY last_seen DESC
+        LIMIT ?
+        """,
+        (vpn_name, int(limit)),
+    )
+    return cur.fetchall()
+
+
+def device_action_token(vpn_name: str, device_key: str):
+    raw = f"{vpn_name}|{device_key}".encode("utf-8", errors="ignore")
+    return hashlib.sha1(raw).hexdigest()[:12]
+
+
+def revoke_device_by_token(conn: sqlite3.Connection, vpn_name: str, token: str):
+    for row in get_all_devices_for_user(conn, vpn_name, limit=300):
+        dkey = (row[0] or "")
+        if device_action_token(vpn_name, dkey) == token:
+            conn.execute(
+                "UPDATE user_devices SET revoked=1 WHERE vpn_name=? AND device_key=?",
+                (vpn_name, dkey),
+            )
+            conn.commit()
+            return True
+    return False
+
+
+def revoke_all_devices(conn: sqlite3.Connection, vpn_name: str):
+    cur = conn.execute(
+        "UPDATE user_devices SET revoked=1 WHERE vpn_name=? AND revoked=0",
+        (vpn_name,),
+    )
+    conn.commit()
+    return int(cur.rowcount or 0)
+
+
+def device_line_label(idx: int, hwid: str, ua: str):
+    ident = (hwid or "").strip()
+    if ident:
+        return f"{idx}. {ident[:18]}"
+    ua = (ua or "").strip()
+    if not ua:
+        return f"{idx}. Устройство"
+    return f"{idx}. {ua.split(' ')[0][:18]}"
 
 
 def get_user(conn: sqlite3.Connection, tg_id: int):
@@ -998,9 +1059,23 @@ def kb_my_sub(connect_url: str):
     return {
         "inline_keyboard": [
             [{"text": "🔌 Подключиться", "url": connect_url}],
+            [{"text": "📱 Мои устройства", "callback_data": CB_MY_DEVICES}],
             [{"text": "⬅️ Вернуться назад", "callback_data": CB_MAIN}],
         ]
     }
+
+
+def kb_my_devices(vpn_name: str, rows: list[tuple]):
+    buttons = []
+    for idx, r in enumerate(rows, start=1):
+        dkey = (r[0] or "")
+        tok = device_action_token(vpn_name, dkey)
+        label = "❌ Отвязать " + device_line_label(idx, (r[1] or ""), (r[2] or ""))
+        buttons.append([{"text": label[:62], "callback_data": f"{CB_MY_DEVICE_REVOKE_PREFIX}{tok}"}])
+    if rows:
+        buttons.append([{"text": "♻️ Отвязать все", "callback_data": CB_MY_DEVICE_REVOKE_ALL}])
+    buttons.append([{"text": "⬅️ Вернуться назад", "callback_data": CB_MY_SUB}])
+    return {"inline_keyboard": buttons}
 
 
 def kb_pay():
@@ -1224,6 +1299,42 @@ def show_my_subscription(conn: sqlite3.Connection, msg: dict):
             f"{info['menu_url']}"
         )
     send_message(chat_id, text, kb_my_sub(info["menu_url"]), parse_mode="HTML")
+
+
+def show_my_devices(conn: sqlite3.Connection, msg: dict):
+    user = msg["from"]
+    chat_id = msg["chat"]["id"]
+    tg_id = int(user["id"])
+    row = get_user(conn, tg_id)
+    if not row:
+        send_message(chat_id, "Подписка не найдена. Нажми /start", kb_main(is_admin=is_admin_user(user)))
+        return
+    vpn_name = row[2]
+    try:
+        ingest_device_log(conn)
+    except Exception as e:
+        print(f"[device-ingest-error] {e}", file=sys.stderr, flush=True)
+    rows = get_devices_for_user(conn, vpn_name, limit=DEVICE_LIST_LIMIT)
+    if not rows:
+        send_message(
+            chat_id,
+            "📱 Устройства\n\nПока нет данных по устройствам.\nОбновите подписку в приложении и попробуйте снова.",
+            kb_my_devices(vpn_name, []),
+        )
+        return
+    lines = [f"📱 Мои устройства ({len(rows)})", ""]
+    for i, r in enumerate(rows, start=1):
+        _, hwid, ua, ip, first_seen, last_seen, hits = r
+        ident = (hwid or "").strip()
+        lines.append(f"{i}) ID: {_safe_text(ident or '—', 40)}")
+        lines.append(f"Последняя активность: {_fmt_ts(int(last_seen or 0))}")
+        lines.append(f"Первый раз: {_fmt_ts(int(first_seen or 0))}")
+        if ip:
+            lines.append(f"IP: {ip}")
+        lines.append(f"User Agent: {_safe_text(ua, 140)}")
+        lines.append(f"Запросов: {int(hits or 0)}")
+        lines.append("")
+    send_message(chat_id, "\n".join(lines)[:3500], kb_my_devices(vpn_name, rows))
 
 
 def show_pay(msg: dict):
@@ -1664,6 +1775,31 @@ def dispatch_action(conn: sqlite3.Connection, msg: dict, action: str):
     elif action in (CB_MY_SUB, "Моя подписка", "👤 Моя подписка"):
         clear_admin_state(conn, tg_id)
         show_my_subscription(conn, msg)
+    elif action == CB_MY_DEVICES:
+        clear_admin_state(conn, tg_id)
+        show_my_devices(conn, msg)
+    elif action == CB_MY_DEVICE_REVOKE_ALL:
+        clear_admin_state(conn, tg_id)
+        row = get_user(conn, tg_id)
+        if not row:
+            send_message(chat_id, "Подписка не найдена. Нажми /start", kb_main(is_admin=is_admin_user(user)))
+            return
+        vpn_name = row[2]
+        n = revoke_all_devices(conn, vpn_name)
+        send_message(chat_id, f"✅ Отвязано устройств: {n}", kb_main(is_admin=is_admin_user(user)))
+    elif action.startswith(CB_MY_DEVICE_REVOKE_PREFIX):
+        clear_admin_state(conn, tg_id)
+        row = get_user(conn, tg_id)
+        if not row:
+            send_message(chat_id, "Подписка не найдена. Нажми /start", kb_main(is_admin=is_admin_user(user)))
+            return
+        vpn_name = row[2]
+        token = action[len(CB_MY_DEVICE_REVOKE_PREFIX):].strip()
+        ok = revoke_device_by_token(conn, vpn_name, token)
+        if ok:
+            send_message(chat_id, "✅ Устройство отвязано.", kb_main(is_admin=is_admin_user(user)))
+        else:
+            send_message(chat_id, "⚠️ Устройство не найдено или уже отвязано.", kb_main(is_admin=is_admin_user(user)))
     elif action in (CB_PAY, "Оплатить подписку", "💰 Оплатить подписку"):
         clear_admin_state(conn, tg_id)
         show_pay(msg)
