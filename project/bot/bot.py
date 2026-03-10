@@ -106,6 +106,7 @@ CB_ADMIN_USERS = "admin_users"
 CB_ADMIN_ACCESS = "admin_access"
 CB_ADMIN_SERVICE = "admin_service"
 CB_ADMIN_DEVICES = "admin_devices"
+CB_ADMIN_DEVICES_REFRESH = "admin_devices_refresh"
 CB_ADMIN_CANCEL = "admin_cancel"
 CB_CONFIRM_BLOCK = "confirm_block"
 CB_CONFIRM_UNBLOCK = "confirm_unblock"
@@ -1591,7 +1592,10 @@ def kb_admin_service():
     return {
         "inline_keyboard": [
             [{"text": "📊 Состояние узла", "callback_data": CB_ADMIN_STATUS}],
-            [{"text": "📱 Устройства", "callback_data": CB_ADMIN_DEVICES}],
+            [
+                {"text": "📱 Устройства", "callback_data": CB_ADMIN_DEVICES},
+                {"text": "🔄 Обновить", "callback_data": CB_ADMIN_DEVICES_REFRESH},
+            ],
             [{"text": "⬅️ Вернуться назад", "callback_data": CB_ADMIN}],
         ]
     }
@@ -1837,7 +1841,7 @@ def show_admin_status(msg: dict):
         send_message(chat_id, text, kb_admin())
 
 
-def show_admin_devices_overview(conn: sqlite3.Connection, msg: dict):
+def show_admin_devices_overview(conn: sqlite3.Connection, msg: dict, force_live: bool = False):
     user = msg["from"]
     chat_id = msg["chat"]["id"]
     if not is_admin_user(user):
@@ -1850,7 +1854,7 @@ def show_admin_devices_overview(conn: sqlite3.Connection, msg: dict):
         parsed = 0
     rows = get_device_stats_by_user(conn, limit=12)
     online_total = online_users_count(conn)
-    live = get_live_online_snapshot(force=False)
+    live = get_live_online_snapshot(force=force_live)
     live_users = live.get("all_users") or set()
     lines = [
         f"📱 Устройства (сбор без лимитов)",
@@ -2330,6 +2334,12 @@ def dispatch_action(conn: sqlite3.Connection, msg: dict, action: str):
             return
         show_admin_devices_overview(conn, msg)
         start_search(conn, msg, intent="devices")
+    elif action == CB_ADMIN_DEVICES_REFRESH:
+        if not is_admin_user(user):
+            send_message(chat_id, "Эта команда только для администратора.", kb_main(is_admin=False))
+            return
+        clear_admin_state(conn, tg_id)
+        show_admin_devices_overview(conn, msg, force_live=True)
     elif action == CB_ADMIN_CANCEL:
         clear_admin_state(conn, tg_id)
         show_admin(msg)
