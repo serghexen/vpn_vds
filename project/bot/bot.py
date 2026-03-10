@@ -65,6 +65,9 @@ LIVE_ONLINE_ENABLED = os.environ.get("LIVE_ONLINE_ENABLED", "1").strip() == "1"
 LIVE_ONLINE_SAMPLE_SEC = int(os.environ.get("LIVE_ONLINE_SAMPLE_SEC", "3"))
 LIVE_ONLINE_TIMEOUT_SEC = int(os.environ.get("LIVE_ONLINE_TIMEOUT_SEC", "12"))
 LIVE_ONLINE_CACHE_TTL_SEC = int(os.environ.get("LIVE_ONLINE_CACHE_TTL_SEC", "20"))
+TRAFFIC_COLLECT_ENABLED = os.environ.get("TRAFFIC_COLLECT_ENABLED", "1").strip() == "1"
+TRAFFIC_COLLECT_INTERVAL_SEC = int(os.environ.get("TRAFFIC_COLLECT_INTERVAL_SEC", "300"))
+TRAFFIC_RETENTION_DAYS = int(os.environ.get("TRAFFIC_RETENTION_DAYS", "14"))
 SSH_KEY_DEFAULT = "/root/.ssh/vless_sync_ed25519"
 SSH_KEY = os.environ.get("SSH_KEY", SSH_KEY_DEFAULT).strip() or SSH_KEY_DEFAULT
 UK_HOST = os.environ.get("UK_HOST", "").strip()
@@ -246,6 +249,19 @@ def init_db(conn: sqlite3.Connection):
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS traffic_samples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            collected_at INTEGER NOT NULL,
+            node TEXT NOT NULL,
+            node_host TEXT NOT NULL DEFAULT '',
+            vpn_name TEXT NOT NULL,
+            uplink_total INTEGER NOT NULL DEFAULT 0,
+            downlink_total INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
     # lightweight migration for existing DBs
     cols = [r[1] for r in conn.execute("PRAGMA table_info(user_devices)").fetchall()]
     if "revoked" not in cols:
@@ -266,6 +282,9 @@ def init_db(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE user_devices ADD COLUMN pending INTEGER NOT NULL DEFAULT 0")
     normalize_tg_alias_devices(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_user_devices_vpn_last ON user_devices(vpn_name, last_seen DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_traffic_samples_time ON traffic_samples(collected_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_traffic_samples_user ON traffic_samples(vpn_name, collected_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_traffic_samples_node ON traffic_samples(node, collected_at)")
     conn.commit()
 
 
@@ -418,6 +437,89 @@ def _statsquery_remote(host: str):
         "/usr/local/bin/xray api statsquery --server=127.0.0.1:10085",
     ]
     return run_cmd(args, timeout_sec=LIVE_ONLINE_TIMEOUT_SEC)
+
+
+def _collect_traffic_node(kind: str, host: str):
+    if kind == "master":
+        rc, out = _statsquery_local()
+        node = "master"
+        node_host = ""
+    else:
+        rc, out = _statsquery_remote(host)
+        node = kind
+        node_host = host
+    if rc != 0:
+        return {"ok": False, "node": node, "node_host": node_host, "error": (out or f"rc={rc}")[:180], "stats": {}}
+    stats = _parse_user_traffic_stats(out)
+    return {"ok": True, "node": node, "node_host": node_host, "error": "", "stats": stats}
+
+
+def collect_traffic_snapshot(conn: sqlite3.Connection):
+    now = int(time.time())
+    entries = []
+    results = []
+
+    # Always try master.
+    results.append(_collect_traffic_node("master", ""))
+    if UK_HOST:
+        results.append(_collect_traffic_node("uk", UK_HOST))
+    if TR_HOST:
+        results.append(_collect_traffic_node("tr", TR_HOST))
+
+    for rec in results:
+        if not rec.get("ok"):
+            print(
+                f"[traffic-collect-error] node={rec.get('node')} host={rec.get('node_host')} err={rec.get('error')}",
+                file=sys.stderr,
+                flush=True,
+            )
+            continue
+        node = rec.get("node") or ""
+        node_host = rec.get("node_host") or ""
+        stats = rec.get("stats") or {}
+        for vpn_name, tr in stats.items():
+            name = (vpn_name or "").strip()
+            if not name:
+                continue
+            uplink = int((tr or {}).get("uplink") or 0)
+            downlink = int((tr or {}).get("downlink") or 0)
+            entries.append((now, node, node_host, name, uplink, downlink))
+
+    if entries:
+        conn.executemany(
+            """
+            INSERT INTO traffic_samples (collected_at, node, node_host, vpn_name, uplink_total, downlink_total)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            entries,
+        )
+
+    # Retention
+    keep_from = now - max(1, TRAFFIC_RETENTION_DAYS) * 86400
+    conn.execute("DELETE FROM traffic_samples WHERE collected_at < ?", (keep_from,))
+    conn.commit()
+    return len(entries)
+
+
+def traffic_collect_loop():
+    if not TRAFFIC_COLLECT_ENABLED:
+        print("[traffic-collect] disabled", file=sys.stderr, flush=True)
+        return
+    conn = sqlite3.connect(DB_PATH)
+    init_db(conn)
+    print(
+        f"[traffic-collect] enabled interval={TRAFFIC_COLLECT_INTERVAL_SEC}s retention={TRAFFIC_RETENTION_DAYS}d",
+        file=sys.stderr,
+        flush=True,
+    )
+    while True:
+        try:
+            n = collect_traffic_snapshot(conn)
+            print(f"[traffic-collect] samples={n}", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[traffic-collect-loop-error] {e}", file=sys.stderr, flush=True)
+            traceback.print_exc()
+        time.sleep(max(60, TRAFFIC_COLLECT_INTERVAL_SEC))
 
 
 def _collect_live_users_for_node(kind: str, host: str):
@@ -2518,6 +2620,8 @@ def main_loop():
     monitor.start()
     trial_notifier = Thread(target=trial_notice_loop, daemon=True)
     trial_notifier.start()
+    traffic_collector = Thread(target=traffic_collect_loop, daemon=True)
+    traffic_collector.start()
 
     offset = 0
     while True:
