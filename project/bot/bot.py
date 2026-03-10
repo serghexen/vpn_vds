@@ -562,7 +562,7 @@ def get_devices_for_user(conn: sqlite3.Connection, vpn_name: str, limit: int = D
         SELECT device_key, hwid, user_agent, ip, platform, os_name, os_version, device_model, app_version, lang, first_seen, last_seen, hits, pending
         FROM user_devices
         WHERE vpn_name=? AND revoked=0
-        ORDER BY pending ASC, last_seen DESC
+        ORDER BY pending ASC, first_seen ASC, last_seen ASC
         LIMIT ?
         """,
         (vpn_name, int(limit)),
@@ -576,7 +576,7 @@ def get_all_devices_for_user(conn: sqlite3.Connection, vpn_name: str, limit: int
         SELECT device_key, hwid, user_agent, ip, platform, os_name, os_version, device_model, app_version, lang, first_seen, last_seen, hits, pending
         FROM user_devices
         WHERE vpn_name=? AND revoked=0
-        ORDER BY pending ASC, last_seen DESC
+        ORDER BY pending ASC, first_seen ASC, last_seen ASC
         LIMIT ?
         """,
         (vpn_name, int(limit)),
@@ -1307,11 +1307,14 @@ def kb_main(is_admin: bool):
     return {"inline_keyboard": rows}
 
 
-def kb_my_sub(connect_url: str):
+def kb_my_sub(connect_url: str, active_devices: int | None = None):
+    devices_label = "📱 Мои устройства"
+    if active_devices is not None:
+        devices_label = f"📱 Мои устройства ({int(active_devices)}/{DEVICE_SOFT_LIMIT})"
     return {
         "inline_keyboard": [
             [{"text": "🔌 Подключиться", "url": connect_url}],
-            [{"text": "📱 Мои устройства", "callback_data": CB_MY_DEVICES}],
+            [{"text": devices_label, "callback_data": CB_MY_DEVICES}],
             [{"text": "⬅️ Вернуться назад", "callback_data": CB_MAIN}],
         ]
     }
@@ -1326,8 +1329,6 @@ def kb_my_devices(vpn_name: str, rows: list[tuple]):
         ident_short = _safe_text(ident, 18)
         label = f"Отключить {ident_short} ({idx})"
         buttons.append([{"text": label[:62], "callback_data": f"{CB_MY_DEVICE_REVOKE_PREFIX}{tok}"}])
-    if rows:
-        buttons.append([{"text": "♻️ Отвязать все", "callback_data": CB_MY_DEVICE_REVOKE_ALL}])
     buttons.append([{"text": "⬅️ Вернуться назад", "callback_data": CB_MY_SUB}])
     return {"inline_keyboard": buttons}
 
@@ -1512,6 +1513,11 @@ def show_my_subscription(conn: sqlite3.Connection, msg: dict):
         return
 
     vpn_name = row[2]
+    try:
+        ingest_device_log(conn)
+    except Exception as e:
+        print(f"[device-ingest-error] {e}", file=sys.stderr, flush=True)
+    active_devices = count_active_devices(conn, vpn_name)
     info = find_subscription_info(vpn_name)
     if not info:
         send_message(chat_id, "Не нашел подписку в системе. Напиши в поддержку.\n\n" + SUPPORT_TEXT, kb_main(is_admin=is_admin_user(user)))
@@ -1552,7 +1558,7 @@ def show_my_subscription(conn: sqlite3.Connection, msg: dict):
             "ℹ️ Если кнопка «Подключиться» не работает, то перейдите по ссылке:\n"
             f"{info['menu_url']}"
         )
-    send_message(chat_id, text, kb_my_sub(info["menu_url"]), parse_mode="HTML")
+    send_message(chat_id, text, kb_my_sub(info["menu_url"], active_devices=active_devices), parse_mode="HTML")
 
 
 def show_my_devices(conn: sqlite3.Connection, msg: dict):
