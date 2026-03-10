@@ -40,6 +40,7 @@ services:
       XRAY_BIN: ""
       XRAY_AUTORELOAD: "0"
       XRAY_RESTART_CMD: "nsenter -t 1 -m -u -i -n -p docker restart hexenvpn-xray >/dev/null"
+      REPLICA_OPS_CMD: /usr/local/sbin/replica-ops
     pid: host
     privileged: true
     volumes:
@@ -49,6 +50,7 @@ services:
       - ./scripts/vless-sync-expire:/usr/local/sbin/vless-sync-expire:ro
       - ./scripts/healthcheck_master_replicas.sh:/usr/local/sbin/healthcheck-master-replicas:ro
       - ./scripts/healthcheck_replica.sh:/usr/local/sbin/healthcheck-replica:ro
+      - ./scripts/replica_ops.sh:/usr/local/sbin/replica-ops:ro
       - ./scripts/metrics_master_light.sh:/usr/local/sbin/metrics-master-light:ro
       - /var/lib/hexenvpn-bot:/var/lib/hexenvpn-bot
       - /var/lib/vless-sub:/var/lib/vless-sub

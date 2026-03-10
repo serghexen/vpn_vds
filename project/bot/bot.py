@@ -59,6 +59,7 @@ REPLICA_MONITOR_ENABLED = os.environ.get("REPLICA_MONITOR_ENABLED", "0").strip()
 REPLICA_MONITOR_INTERVAL_SEC = int(os.environ.get("REPLICA_MONITOR_INTERVAL_SEC", "300"))
 REPLICA_MONITOR_COOLDOWN_SEC = int(os.environ.get("REPLICA_MONITOR_COOLDOWN_SEC", "1800"))
 REPLICA_MONITOR_CMD = os.environ.get("REPLICA_MONITOR_CMD", "/usr/local/sbin/healthcheck-replica")
+REPLICA_OPS_CMD = os.environ.get("REPLICA_OPS_CMD", "/usr/local/sbin/replica-ops")
 METRICS_CMD = os.environ.get("METRICS_CMD", "/usr/local/sbin/metrics-master-light")
 DEVICE_LOG_PATH = os.environ.get("DEVICE_LOG_PATH", "/var/log/nginx/sub_access.log")
 DEVICE_BOOTSTRAP_BYTES = int(os.environ.get("DEVICE_BOOTSTRAP_BYTES", str(2 * 1024 * 1024)))
@@ -118,11 +119,15 @@ CB_ADMIN_ONLINE = "admin_online"
 CB_ADMIN_TRAFFIC = "admin_traffic"
 CB_ADMIN_TRAFFIC_PICK = "admin_traffic_pick"
 CB_ADMIN_TRAFFIC_REFRESH = "admin_traffic_refresh"
+CB_ADMIN_RESTART_UK = "admin_restart_uk"
+CB_ADMIN_RESTART_TR = "admin_restart_tr"
 CB_ADMIN_CANCEL = "admin_cancel"
 CB_CONFIRM_BLOCK = "confirm_block"
 CB_CONFIRM_UNBLOCK = "confirm_unblock"
 CB_CONFIRM_TRIAL_OFF = "confirm_trial_off"
 CB_CONFIRM_DELETE = "confirm_delete"
+CB_CONFIRM_RESTART_UK = "confirm_restart_uk"
+CB_CONFIRM_RESTART_TR = "confirm_restart_tr"
 CB_SEL_PREV = "sel_prev"
 CB_SEL_NEXT = "sel_next"
 CB_SEL_FIND = "sel_find"
@@ -138,6 +143,8 @@ STATE_BLOCK_CONFIRM = "block_confirm"
 STATE_UNBLOCK_CONFIRM = "unblock_confirm"
 STATE_TRIAL_OFF_CONFIRM = "trial_off_confirm"
 STATE_DEL_CONFIRM = "del_confirm"
+STATE_RESTART_UK_CONFIRM = "restart_uk_confirm"
+STATE_RESTART_TR_CONFIRM = "restart_tr_confirm"
 STATE_SELECT_USER = "select_user"
 STATE_SEARCH_QUERY = "search_query"
 
@@ -1907,6 +1914,10 @@ def kb_admin_service():
                 {"text": "🟢 Онлайн сессии", "callback_data": CB_ADMIN_ONLINE},
             ],
             [{"text": "📊 Трафик (24ч)", "callback_data": CB_ADMIN_TRAFFIC}],
+            [
+                {"text": "🔁 Рестарт UK", "callback_data": CB_ADMIN_RESTART_UK},
+                {"text": "🔁 Рестарт TR", "callback_data": CB_ADMIN_RESTART_TR},
+            ],
             [{"text": "🔄 Обновить", "callback_data": CB_ADMIN_DEVICES_REFRESH}],
             [{"text": "⬅️ Вернуться назад", "callback_data": CB_ADMIN}],
         ]
@@ -2580,6 +2591,30 @@ def handle_confirm_callback(conn: sqlite3.Connection, msg: dict, action: str, st
             send_message(chat_id, f"❌ Не удалось удалить {name}.\n\n{out[:1200]}", kb_admin())
         return True
 
+    if step == STATE_RESTART_UK_CONFIRM and action == CB_CONFIRM_RESTART_UK:
+        args = [REPLICA_OPS_CMD, "--node", "uk", "--action", "restart-post"]
+        if MONITOR_CHECK_USER:
+            args += ["--user", MONITOR_CHECK_USER]
+        rc, out = run_cmd(args, timeout_sec=180)
+        clear_admin_state(conn, tg_id)
+        if rc == 0:
+            send_message(chat_id, "✅ Реплика UK: xray перезапущен, post-check OK.", kb_admin_service())
+        else:
+            send_message(chat_id, f"❌ Реплика UK: ошибка restart/post-check.\n\n{(out or '')[:2000]}", kb_admin_service())
+        return True
+
+    if step == STATE_RESTART_TR_CONFIRM and action == CB_CONFIRM_RESTART_TR:
+        args = [REPLICA_OPS_CMD, "--node", "tr", "--action", "restart-post"]
+        if MONITOR_CHECK_USER:
+            args += ["--user", MONITOR_CHECK_USER]
+        rc, out = run_cmd(args, timeout_sec=180)
+        clear_admin_state(conn, tg_id)
+        if rc == 0:
+            send_message(chat_id, "✅ Реплика TR: xray перезапущен, post-check OK.", kb_admin_service())
+        else:
+            send_message(chat_id, f"❌ Реплика TR: ошибка restart/post-check.\n\n{(out or '')[:2000]}", kb_admin_service())
+        return True
+
     return False
 
 
@@ -2698,6 +2733,8 @@ def dispatch_action(conn: sqlite3.Connection, msg: dict, action: str):
         CB_CONFIRM_UNBLOCK,
         CB_CONFIRM_TRIAL_OFF,
         CB_CONFIRM_DELETE,
+        CB_CONFIRM_RESTART_UK,
+        CB_CONFIRM_RESTART_TR,
     ):
         if handle_confirm_callback(conn, msg, action, st):
             return
@@ -2819,6 +2856,18 @@ def dispatch_action(conn: sqlite3.Connection, msg: dict, action: str):
             return
         clear_admin_state(conn, tg_id)
         show_admin_traffic(conn, msg, hours=24)
+    elif action == CB_ADMIN_RESTART_UK:
+        if not is_admin_user(user):
+            send_message(chat_id, "Эта команда только для администратора.", kb_main(is_admin=False))
+            return
+        set_admin_state(conn, tg_id, STATE_RESTART_UK_CONFIRM, {})
+        send_message(chat_id, "Подтвердить мягкий рестарт xray на реплике UK и post-check?", kb_confirm(CB_CONFIRM_RESTART_UK))
+    elif action == CB_ADMIN_RESTART_TR:
+        if not is_admin_user(user):
+            send_message(chat_id, "Эта команда только для администратора.", kb_main(is_admin=False))
+            return
+        set_admin_state(conn, tg_id, STATE_RESTART_TR_CONFIRM, {})
+        send_message(chat_id, "Подтвердить мягкий рестарт xray на реплике TR и post-check?", kb_confirm(CB_CONFIRM_RESTART_TR))
     elif action == CB_ADMIN_CANCEL:
         clear_admin_state(conn, tg_id)
         show_admin(msg)
