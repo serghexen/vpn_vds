@@ -97,6 +97,7 @@ Bootstrap-скрипт:
   - `project/scripts/metrics_master_light.sh`
   - `project/docs/MONITORING_LIGHT.md`
   - в админке: `📈 Трафик узлов` + опциональный daily-отчет по узлам
+  - опциональные алерты аномалий трафика/сессий
 - Оценка ёмкости:
   - `project/scripts/capacity_estimate.sh`
   - `project/docs/SIZING.md`

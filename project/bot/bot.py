@@ -77,6 +77,14 @@ TRAFFIC_REPORT_ENABLED = os.environ.get("TRAFFIC_REPORT_ENABLED", "0").strip() =
 TRAFFIC_REPORT_INTERVAL_SEC = int(os.environ.get("TRAFFIC_REPORT_INTERVAL_SEC", "300"))
 TRAFFIC_REPORT_HOUR = int(os.environ.get("TRAFFIC_REPORT_HOUR", "10"))
 TRAFFIC_REPORT_MINUTE = int(os.environ.get("TRAFFIC_REPORT_MINUTE", "0"))
+TRAFFIC_ANOMALY_ENABLED = os.environ.get("TRAFFIC_ANOMALY_ENABLED", "0").strip() == "1"
+TRAFFIC_ANOMALY_INTERVAL_SEC = int(os.environ.get("TRAFFIC_ANOMALY_INTERVAL_SEC", "300"))
+TRAFFIC_ANOMALY_COOLDOWN_SEC = int(os.environ.get("TRAFFIC_ANOMALY_COOLDOWN_SEC", "1800"))
+TRAFFIC_ANOMALY_WINDOW_MIN = int(os.environ.get("TRAFFIC_ANOMALY_WINDOW_MIN", "15"))
+TRAFFIC_ANOMALY_RATIO = float(os.environ.get("TRAFFIC_ANOMALY_RATIO", "2.5"))
+TRAFFIC_ANOMALY_MIN_TOTAL_MB = int(os.environ.get("TRAFFIC_ANOMALY_MIN_TOTAL_MB", "500"))
+CONN_SPIKE_DELTA = int(os.environ.get("CONN_SPIKE_DELTA", "5"))
+CONN_SPIKE_MIN_ONLINE = int(os.environ.get("CONN_SPIKE_MIN_ONLINE", "8"))
 SSH_KEY_DEFAULT = "/root/.ssh/vless_sync_ed25519"
 SSH_KEY = os.environ.get("SSH_KEY", SSH_KEY_DEFAULT).strip() or SSH_KEY_DEFAULT
 UK_HOST = os.environ.get("UK_HOST", "").strip()
@@ -1144,6 +1152,51 @@ def build_node_traffic_report_text(conn: sqlite3.Connection, now_ts: int | None 
     return "\n".join(lines)[:3500]
 
 
+def _traffic_total_between(conn: sqlite3.Connection, start_ts: int, end_ts: int):
+    start_ts = int(start_ts)
+    end_ts = int(end_ts)
+    if end_ts <= start_ts:
+        return 0, {}
+    cur = conn.execute(
+        """
+        SELECT collected_at, node, node_host, vpn_name, uplink_total, downlink_total
+        FROM traffic_samples
+        WHERE collected_at >= ? AND collected_at < ?
+        ORDER BY collected_at ASC
+        """,
+        (start_ts, end_ts),
+    )
+    prev = {}
+    node_totals = {}
+    for _ts, node, node_host, raw_name, up_total, down_total in cur.fetchall():
+        name = canonical_vpn_name(conn, (raw_name or "").strip())
+        if not name:
+            continue
+        node_label = _traffic_node_label(node, node_host)
+        key = (name, node_label)
+        up_total = int(up_total or 0)
+        down_total = int(down_total or 0)
+        p = prev.get(key)
+        if p is None:
+            prev[key] = (up_total, down_total)
+            continue
+        prev_up, prev_down = p
+        du = up_total - prev_up
+        dd = down_total - prev_down
+        if du < 0:
+            du = up_total
+        if dd < 0:
+            dd = down_total
+        if du < 0:
+            du = 0
+        if dd < 0:
+            dd = 0
+        prev[key] = (up_total, down_total)
+        node_totals[node_label] = int(node_totals.get(node_label, 0)) + du + dd
+    total = sum(int(v or 0) for v in node_totals.values())
+    return int(total), node_totals
+
+
 def get_all_devices_for_user(conn: sqlite3.Connection, vpn_name: str, limit: int = 200):
     cur = conn.execute(
         """
@@ -1691,6 +1744,71 @@ def traffic_report_loop():
             print(f"[traffic-report-loop-error] {e}", file=sys.stderr, flush=True)
             traceback.print_exc()
         time.sleep(max(60, TRAFFIC_REPORT_INTERVAL_SEC))
+
+
+def traffic_anomaly_loop():
+    if not TRAFFIC_ANOMALY_ENABLED:
+        print("[traffic-anomaly] disabled", file=sys.stderr, flush=True)
+        return
+    conn = sqlite3.connect(DB_PATH)
+    init_db(conn)
+    print(
+        "[traffic-anomaly] enabled "
+        f"interval={TRAFFIC_ANOMALY_INTERVAL_SEC}s "
+        f"window={TRAFFIC_ANOMALY_WINDOW_MIN}m "
+        f"ratio={TRAFFIC_ANOMALY_RATIO} "
+        f"min_total_mb={TRAFFIC_ANOMALY_MIN_TOTAL_MB} "
+        f"conn_delta={CONN_SPIKE_DELTA}",
+        file=sys.stderr,
+        flush=True,
+    )
+    last_alert_at = {"traffic": 0, "connections": 0}
+    last_live_count = None
+    while True:
+        try:
+            now_ts = int(time.time())
+            win_sec = max(300, int(TRAFFIC_ANOMALY_WINDOW_MIN) * 60)
+            cur_total, cur_nodes = _traffic_total_between(conn, now_ts - win_sec, now_ts)
+            prev_total, _prev_nodes = _traffic_total_between(conn, now_ts - 2 * win_sec, now_ts - win_sec)
+            min_total_bytes = max(1, int(TRAFFIC_ANOMALY_MIN_TOTAL_MB)) * 1024 * 1024
+            if prev_total > 0:
+                ratio = float(cur_total) / float(prev_total)
+                if cur_total >= min_total_bytes and ratio >= float(TRAFFIC_ANOMALY_RATIO):
+                    if (now_ts - int(last_alert_at.get("traffic") or 0)) >= TRAFFIC_ANOMALY_COOLDOWN_SEC:
+                        top_nodes = sorted(cur_nodes.items(), key=lambda x: int(x[1] or 0), reverse=True)[:3]
+                        top_txt = ", ".join([f"{n}={_fmt_bytes(v)}" for n, v in top_nodes]) if top_nodes else "n/a"
+                        send_admin_alert(
+                            "🚨 Аномалия трафика.\n"
+                            f"Окно: {TRAFFIC_ANOMALY_WINDOW_MIN} мин\n"
+                            f"Текущее: {_fmt_bytes(cur_total)}\n"
+                            f"Предыдущее: {_fmt_bytes(prev_total)}\n"
+                            f"Рост: x{ratio:.2f}\n"
+                            f"Узлы: {top_txt}"
+                        )
+                        last_alert_at["traffic"] = now_ts
+                        print("[traffic-anomaly] alerted traffic spike", file=sys.stderr, flush=True)
+
+            if LIVE_ONLINE_ENABLED:
+                live = get_live_online_snapshot(force=True)
+                cur_live = len(live.get("all_users") or set())
+                if last_live_count is not None:
+                    delta = int(cur_live) - int(last_live_count)
+                    if int(cur_live) >= CONN_SPIKE_MIN_ONLINE and delta >= CONN_SPIKE_DELTA:
+                        if (now_ts - int(last_alert_at.get("connections") or 0)) >= TRAFFIC_ANOMALY_COOLDOWN_SEC:
+                            send_admin_alert(
+                                "🚨 Всплеск live-сессий.\n"
+                                f"Сейчас: {cur_live}\n"
+                                f"Было: {last_live_count}\n"
+                                f"Δ: +{delta}\n"
+                                f"Окно проверки: {LIVE_ONLINE_SAMPLE_SEC} сек"
+                            )
+                            last_alert_at["connections"] = now_ts
+                            print("[traffic-anomaly] alerted connection spike", file=sys.stderr, flush=True)
+                last_live_count = int(cur_live)
+        except Exception as e:
+            print(f"[traffic-anomaly-loop-error] {e}", file=sys.stderr, flush=True)
+            traceback.print_exc()
+        time.sleep(max(60, TRAFFIC_ANOMALY_INTERVAL_SEC))
 
 
 def trial_notice_loop():
@@ -3163,6 +3281,8 @@ def main_loop():
     replica_monitor.start()
     traffic_reporter = Thread(target=traffic_report_loop, daemon=True)
     traffic_reporter.start()
+    traffic_anomaly = Thread(target=traffic_anomaly_loop, daemon=True)
+    traffic_anomaly.start()
     trial_notifier = Thread(target=trial_notice_loop, daemon=True)
     trial_notifier.start()
     traffic_collector = Thread(target=traffic_collect_loop, daemon=True)

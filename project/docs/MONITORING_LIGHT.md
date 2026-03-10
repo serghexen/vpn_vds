@@ -77,3 +77,22 @@ TRAFFIC_REPORT_MINUTE=0
 - бот раз в день после указанного времени отправляет админам отчет по узлам:
   - трафик за 24 часа;
   - трафик с начала текущего месяца.
+
+## Алерты аномалий трафика/сессий (опционально)
+
+В `project/env/bot.env`:
+```env
+TRAFFIC_ANOMALY_ENABLED=1
+TRAFFIC_ANOMALY_INTERVAL_SEC=300
+TRAFFIC_ANOMALY_COOLDOWN_SEC=1800
+TRAFFIC_ANOMALY_WINDOW_MIN=15
+TRAFFIC_ANOMALY_RATIO=2.5
+TRAFFIC_ANOMALY_MIN_TOTAL_MB=500
+CONN_SPIKE_DELTA=5
+CONN_SPIKE_MIN_ONLINE=8
+```
+
+Что делает:
+- алерт, если в текущем окне трафик резко выше предыдущего окна;
+- алерт, если резко выросло число live-сессий;
+- применяет cooldown, чтобы не спамить.
