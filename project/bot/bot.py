@@ -111,6 +111,9 @@ CB_ADMIN_SERVICE = "admin_service"
 CB_ADMIN_DEVICES = "admin_devices"
 CB_ADMIN_DEVICES_REFRESH = "admin_devices_refresh"
 CB_ADMIN_ONLINE = "admin_online"
+CB_ADMIN_TRAFFIC = "admin_traffic"
+CB_ADMIN_TRAFFIC_PICK = "admin_traffic_pick"
+CB_ADMIN_TRAFFIC_REFRESH = "admin_traffic_refresh"
 CB_ADMIN_CANCEL = "admin_cancel"
 CB_CONFIRM_BLOCK = "confirm_block"
 CB_CONFIRM_UNBLOCK = "confirm_unblock"
@@ -877,6 +880,119 @@ def get_devices_for_user(conn: sqlite3.Connection, vpn_name: str, limit: int = D
         (vpn_name, int(limit)),
     )
     return cur.fetchall()
+
+
+def _fmt_bytes(n: int):
+    size = float(max(0, int(n or 0)))
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    idx = 0
+    while size >= 1024.0 and idx < len(units) - 1:
+        size /= 1024.0
+        idx += 1
+    if idx == 0:
+        return f"{int(size)} {units[idx]}"
+    return f"{size:.1f} {units[idx]}"
+
+
+def _traffic_node_label(node: str, node_host: str):
+    n = (node or "").strip()
+    h = (node_host or "").strip()
+    if n == "master":
+        return "master"
+    if h:
+        return f"{n}:{h}"
+    return n or "-"
+
+
+def _traffic_window_aggregate(conn: sqlite3.Connection, since_ts: int):
+    cur = conn.execute(
+        """
+        SELECT collected_at, node, node_host, vpn_name, uplink_total, downlink_total
+        FROM traffic_samples
+        WHERE collected_at >= ?
+        ORDER BY collected_at ASC
+        """,
+        (int(since_ts),),
+    )
+    prev = {}
+    agg = {}
+    for collected_at, node, node_host, raw_name, up_total, down_total in cur.fetchall():
+        name = canonical_vpn_name(conn, (raw_name or "").strip())
+        if not name:
+            continue
+        node_label = _traffic_node_label(node, node_host)
+        key = (name, node_label)
+        up_total = int(up_total or 0)
+        down_total = int(down_total or 0)
+        p = prev.get(key)
+        if p is None:
+            prev[key] = (up_total, down_total, int(collected_at or 0))
+            continue
+        prev_up, prev_down, _prev_ts = p
+        du = up_total - prev_up
+        dd = down_total - prev_down
+        # Counter reset: treat current value as delta since reset.
+        if du < 0:
+            du = up_total
+        if dd < 0:
+            dd = down_total
+        if du < 0:
+            du = 0
+        if dd < 0:
+            dd = 0
+        prev[key] = (up_total, down_total, int(collected_at or 0))
+        user_rec = agg.setdefault(name, {"uplink": 0, "downlink": 0, "nodes": {}, "last_ts": 0})
+        user_rec["uplink"] += du
+        user_rec["downlink"] += dd
+        user_rec["last_ts"] = max(int(user_rec.get("last_ts") or 0), int(collected_at or 0))
+        node_rec = user_rec["nodes"].setdefault(node_label, {"uplink": 0, "downlink": 0})
+        node_rec["uplink"] += du
+        node_rec["downlink"] += dd
+    return agg
+
+
+def get_traffic_top(conn: sqlite3.Connection, hours: int = 24, limit: int = 12):
+    since_ts = int(time.time()) - max(1, int(hours)) * 3600
+    agg = _traffic_window_aggregate(conn, since_ts)
+    rows = []
+    for name, rec in agg.items():
+        up = int(rec.get("uplink") or 0)
+        down = int(rec.get("downlink") or 0)
+        total = up + down
+        if total <= 0:
+            continue
+        rows.append(
+            {
+                "vpn_name": name,
+                "uplink": up,
+                "downlink": down,
+                "total": total,
+                "last_ts": int(rec.get("last_ts") or 0),
+            }
+        )
+    rows.sort(key=lambda r: (r["total"], r["downlink"], r["uplink"]), reverse=True)
+    return rows[: max(1, int(limit))]
+
+
+def get_traffic_user_breakdown(conn: sqlite3.Connection, vpn_name: str, hours: int = 24):
+    since_ts = int(time.time()) - max(1, int(hours)) * 3600
+    agg = _traffic_window_aggregate(conn, since_ts)
+    rec = agg.get((vpn_name or "").strip()) or {"uplink": 0, "downlink": 0, "nodes": {}, "last_ts": 0}
+    nodes = []
+    for node_name, nrec in (rec.get("nodes") or {}).items():
+        up = int(nrec.get("uplink") or 0)
+        down = int(nrec.get("downlink") or 0)
+        total = up + down
+        nodes.append({"node": node_name, "uplink": up, "downlink": down, "total": total})
+    nodes.sort(key=lambda x: (x["total"], x["downlink"], x["uplink"]), reverse=True)
+    return {
+        "vpn_name": (vpn_name or "").strip(),
+        "uplink": int(rec.get("uplink") or 0),
+        "downlink": int(rec.get("downlink") or 0),
+        "total": int(rec.get("uplink") or 0) + int(rec.get("downlink") or 0),
+        "last_ts": int(rec.get("last_ts") or 0),
+        "nodes": nodes,
+    }
 
 
 def get_all_devices_for_user(conn: sqlite3.Connection, vpn_name: str, limit: int = 200):
@@ -1730,8 +1846,21 @@ def kb_admin_service():
                 {"text": "📱 Устройства", "callback_data": CB_ADMIN_DEVICES},
                 {"text": "🟢 Онлайн сессии", "callback_data": CB_ADMIN_ONLINE},
             ],
+            [{"text": "📊 Трафик (24ч)", "callback_data": CB_ADMIN_TRAFFIC}],
             [{"text": "🔄 Обновить", "callback_data": CB_ADMIN_DEVICES_REFRESH}],
             [{"text": "⬅️ Вернуться назад", "callback_data": CB_ADMIN}],
+        ]
+    }
+
+
+def kb_admin_traffic():
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "👤 Пользователь", "callback_data": CB_ADMIN_TRAFFIC_PICK},
+                {"text": "🔄 Обновить", "callback_data": CB_ADMIN_TRAFFIC_REFRESH},
+            ],
+            [{"text": "⬅️ Вернуться назад", "callback_data": CB_ADMIN_SERVICE}],
         ]
     }
 
@@ -2073,6 +2202,56 @@ def show_admin_online_sessions(conn: sqlite3.Connection, msg: dict, force_live: 
     send_message(chat_id, "\n".join(lines)[:3500], kb_admin_service())
 
 
+def show_admin_traffic(conn: sqlite3.Connection, msg: dict, hours: int = 24):
+    user = msg["from"]
+    chat_id = msg["chat"]["id"]
+    if not is_admin_user(user):
+        send_message(chat_id, "Эта команда только для администратора.", kb_main(is_admin=False))
+        return
+    rows = get_traffic_top(conn, hours=hours, limit=15)
+    lines = [f"📊 Трафик за {hours}ч"]
+    if not rows:
+        lines.append("")
+        lines.append("Данных пока нет. Сбор трафика выполняется периодически.")
+        send_message(chat_id, "\n".join(lines), kb_admin_traffic())
+        return
+    lines.append("")
+    lines.append("Топ пользователей:")
+    for i, r in enumerate(rows, start=1):
+        name = r["vpn_name"]
+        disp = display_name_for(conn, name) or name
+        who = f"{disp} ({name})" if disp != name else name
+        lines.append(
+            f"{i}. {who} — ↓{_fmt_bytes(r['downlink'])} ↑{_fmt_bytes(r['uplink'])} Σ{_fmt_bytes(r['total'])}"
+        )
+    lines.append("")
+    lines.append("Нажми «👤 Пользователь», чтобы открыть деталку.")
+    send_message(chat_id, "\n".join(lines)[:3500], kb_admin_traffic())
+
+
+def show_admin_user_traffic(conn: sqlite3.Connection, msg: dict, vpn_name: str, hours: int = 24):
+    chat_id = msg["chat"]["id"]
+    info = get_traffic_user_breakdown(conn, vpn_name, hours=hours)
+    disp = display_name_for(conn, vpn_name) or vpn_name
+    who = f"{disp} ({vpn_name})" if disp != vpn_name else vpn_name
+    lines = [f"📊 Трафик пользователя {who}", f"Окно: {hours}ч", ""]
+    lines.append(
+        f"Итого: ↓{_fmt_bytes(info['downlink'])} ↑{_fmt_bytes(info['uplink'])} Σ{_fmt_bytes(info['total'])}"
+    )
+    lines.append(f"Последний срез: {_fmt_ts(int(info.get('last_ts') or 0))}")
+    if info["nodes"]:
+        lines.append("")
+        lines.append("По узлам:")
+        for r in info["nodes"]:
+            lines.append(
+                f"- {r['node']}: ↓{_fmt_bytes(r['downlink'])} ↑{_fmt_bytes(r['uplink'])} Σ{_fmt_bytes(r['total'])}"
+            )
+    else:
+        lines.append("")
+        lines.append("По узлам: данных нет.")
+    send_message(chat_id, "\n".join(lines)[:3500], kb_admin_traffic())
+
+
 def show_admin_user_devices(conn: sqlite3.Connection, msg: dict, vpn_name: str):
     chat_id = msg["chat"]["id"]
     try:
@@ -2174,6 +2353,9 @@ def start_select(conn: sqlite3.Connection, msg: dict, intent: str, query: str = 
         can_choose = True
     elif intent == "devices":
         title = "Устройства: выбери пользователя"
+        can_choose = True
+    elif intent == "traffic":
+        title = "Трафик: выбери пользователя"
         can_choose = True
     else:
         title = "Удаление: выбери пользователя"
@@ -2430,6 +2612,10 @@ def handle_selector_callback(conn: sqlite3.Connection, msg: dict, action: str, s
             clear_admin_state(conn, tg_id)
             show_admin_user_devices(conn, msg, name)
             return True
+        if intent == "traffic":
+            clear_admin_state(conn, tg_id)
+            show_admin_user_traffic(conn, msg, name, hours=24)
+            return True
         if intent == "del":
             set_admin_state(conn, tg_id, STATE_DEL_CONFIRM, {"name": name})
             send_message(chat_id, f"Подтвердить удаление пользователя {name}?", kb_confirm(CB_CONFIRM_DELETE))
@@ -2556,6 +2742,23 @@ def dispatch_action(conn: sqlite3.Connection, msg: dict, action: str):
             return
         clear_admin_state(conn, tg_id)
         show_admin_online_sessions(conn, msg, force_live=True)
+    elif action == CB_ADMIN_TRAFFIC:
+        if not is_admin_user(user):
+            send_message(chat_id, "Эта команда только для администратора.", kb_main(is_admin=False))
+            return
+        clear_admin_state(conn, tg_id)
+        show_admin_traffic(conn, msg, hours=24)
+    elif action == CB_ADMIN_TRAFFIC_PICK:
+        if not is_admin_user(user):
+            send_message(chat_id, "Эта команда только для администратора.", kb_main(is_admin=False))
+            return
+        start_select(conn, msg, intent="traffic", query="", offset=0)
+    elif action == CB_ADMIN_TRAFFIC_REFRESH:
+        if not is_admin_user(user):
+            send_message(chat_id, "Эта команда только для администратора.", kb_main(is_admin=False))
+            return
+        clear_admin_state(conn, tg_id)
+        show_admin_traffic(conn, msg, hours=24)
     elif action == CB_ADMIN_CANCEL:
         clear_admin_state(conn, tg_id)
         show_admin(msg)
