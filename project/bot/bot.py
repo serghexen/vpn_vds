@@ -204,6 +204,12 @@ def init_db(conn: sqlite3.Connection):
             hwid TEXT NOT NULL DEFAULT '',
             user_agent TEXT NOT NULL DEFAULT '',
             ip TEXT NOT NULL DEFAULT '',
+            platform TEXT NOT NULL DEFAULT '',
+            os_name TEXT NOT NULL DEFAULT '',
+            os_version TEXT NOT NULL DEFAULT '',
+            device_model TEXT NOT NULL DEFAULT '',
+            app_version TEXT NOT NULL DEFAULT '',
+            lang TEXT NOT NULL DEFAULT '',
             first_seen INTEGER NOT NULL,
             last_seen INTEGER NOT NULL,
             hits INTEGER NOT NULL DEFAULT 1,
@@ -227,6 +233,18 @@ def init_db(conn: sqlite3.Connection):
     cols = [r[1] for r in conn.execute("PRAGMA table_info(user_devices)").fetchall()]
     if "revoked" not in cols:
         conn.execute("ALTER TABLE user_devices ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0")
+    if "platform" not in cols:
+        conn.execute("ALTER TABLE user_devices ADD COLUMN platform TEXT NOT NULL DEFAULT ''")
+    if "os_name" not in cols:
+        conn.execute("ALTER TABLE user_devices ADD COLUMN os_name TEXT NOT NULL DEFAULT ''")
+    if "os_version" not in cols:
+        conn.execute("ALTER TABLE user_devices ADD COLUMN os_version TEXT NOT NULL DEFAULT ''")
+    if "device_model" not in cols:
+        conn.execute("ALTER TABLE user_devices ADD COLUMN device_model TEXT NOT NULL DEFAULT ''")
+    if "app_version" not in cols:
+        conn.execute("ALTER TABLE user_devices ADD COLUMN app_version TEXT NOT NULL DEFAULT ''")
+    if "lang" not in cols:
+        conn.execute("ALTER TABLE user_devices ADD COLUMN lang TEXT NOT NULL DEFAULT ''")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_user_devices_vpn_last ON user_devices(vpn_name, last_seen DESC)")
     conn.commit()
 
@@ -263,15 +281,47 @@ def _norm_field(raw: str):
     return s
 
 
-def _device_key(hwid: str, ua: str):
+def _sub_key_from_uri(uri: str):
+    u = (uri or "").strip()
+    if not u:
+        return ""
+    path = u.split("?", 1)[0]
+    m = re.fullmatch(r"/sub/([A-Za-z0-9._-]+)", path)
+    if not m:
+        return ""
+    return m.group(1)
+
+
+def _device_key(
+    hwid: str,
+    ua: str,
+    ip: str = "",
+    lang: str = "",
+    app_version: str = "",
+    platform: str = "",
+    os_name: str = "",
+    os_version: str = "",
+    device_model: str = "",
+):
     h = _norm_field(hwid)
     if h:
         return "hwid:" + h.lower()
-    ua_norm = _norm_field(ua).lower()
-    if not ua_norm:
+    fp_src = "|".join(
+        [
+            _norm_field(ua).lower(),
+            _norm_field(ip),
+            _norm_field(lang).lower(),
+            _norm_field(app_version).lower(),
+            _norm_field(platform).lower(),
+            _norm_field(os_name).lower(),
+            _norm_field(os_version).lower(),
+            _norm_field(device_model).lower(),
+        ]
+    ).strip("|")
+    if not fp_src:
         return "unknown"
-    digest = hashlib.sha1(ua_norm.encode("utf-8", errors="ignore")).hexdigest()[:16]
-    return "ua:" + digest
+    digest = hashlib.sha1(fp_src.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return "fp:" + digest
 
 
 def ingest_device_log(conn: sqlite3.Connection):
@@ -308,40 +358,73 @@ def ingest_device_log(conn: sqlite3.Connection):
             parts = line.split("\t")
             if len(parts) < 9:
                 continue
+            def p(i: int):
+                if i < len(parts):
+                    return _norm_field(parts[i])
+                return ""
 
             try:
-                ts = int(float(parts[0]))
+                ts = int(float(p(0)))
             except Exception:
                 ts = now
 
-            ip = _norm_field(parts[1])
-            uri = _norm_field(parts[2])
-            ua = _norm_field(parts[3])
-            hwid = _norm_field(parts[4]) or _norm_field(parts[5]) or _norm_field(parts[6]) or _norm_field(parts[7]) or _norm_field(parts[8])
+            ip = p(1)
+            uri = p(2)
+            ua = p(3)
+            hwid = p(4) or p(5) or p(6) or p(7) or p(8)
+            device_name = p(9)
+            platform = p(10)
+            os_name = p(11)
+            os_version = p(12)
+            device_model = p(13) or device_name
+            app_version = p(14) or p(15)
+            lang = p(16)
+            ch_ua = p(17)
+            ch_platform = p(18)
 
-            m = re.fullmatch(r"/sub/([A-Za-z0-9._-]+)", uri)
-            if not m:
+            if not ua and ch_ua:
+                ua = ch_ua
+            if not platform and ch_platform:
+                platform = ch_platform
+
+            sub_key = _sub_key_from_uri(uri)
+            if not sub_key:
                 continue
-            sub_key = m.group(1)
             vpn_name = _resolve_vpn_name_by_sub_key(sub_key)
             if not vpn_name:
                 continue
 
-            dkey = _device_key(hwid, ua)
+            dkey = _device_key(
+                hwid=hwid,
+                ua=ua,
+                ip=ip,
+                lang=lang,
+                app_version=app_version,
+                platform=platform,
+                os_name=os_name,
+                os_version=os_version,
+                device_model=device_model,
+            )
             conn.execute(
                 """
-                INSERT INTO user_devices (vpn_name, device_key, hwid, user_agent, ip, first_seen, last_seen, hits, last_path)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+                INSERT INTO user_devices (vpn_name, device_key, hwid, user_agent, ip, platform, os_name, os_version, device_model, app_version, lang, first_seen, last_seen, hits, last_path)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
                 ON CONFLICT(vpn_name, device_key) DO UPDATE SET
                     hwid=CASE WHEN excluded.hwid != '' THEN excluded.hwid ELSE user_devices.hwid END,
                     user_agent=excluded.user_agent,
                     ip=excluded.ip,
+                    platform=CASE WHEN excluded.platform != '' THEN excluded.platform ELSE user_devices.platform END,
+                    os_name=CASE WHEN excluded.os_name != '' THEN excluded.os_name ELSE user_devices.os_name END,
+                    os_version=CASE WHEN excluded.os_version != '' THEN excluded.os_version ELSE user_devices.os_version END,
+                    device_model=CASE WHEN excluded.device_model != '' THEN excluded.device_model ELSE user_devices.device_model END,
+                    app_version=CASE WHEN excluded.app_version != '' THEN excluded.app_version ELSE user_devices.app_version END,
+                    lang=CASE WHEN excluded.lang != '' THEN excluded.lang ELSE user_devices.lang END,
                     last_seen=excluded.last_seen,
                     hits=user_devices.hits + 1,
                     revoked=0,
                     last_path=excluded.last_path
                 """,
-                (vpn_name, dkey, hwid, ua, ip, ts, ts, uri),
+                (vpn_name, dkey, hwid, ua, ip, platform, os_name, os_version, device_model, app_version, lang, ts, ts, uri),
             )
             parsed += 1
 
@@ -377,7 +460,7 @@ def get_device_stats_by_user(conn: sqlite3.Connection, limit: int = 20):
 def get_devices_for_user(conn: sqlite3.Connection, vpn_name: str, limit: int = DEVICE_LIST_LIMIT):
     cur = conn.execute(
         """
-        SELECT device_key, hwid, user_agent, ip, first_seen, last_seen, hits
+        SELECT device_key, hwid, user_agent, ip, platform, os_name, os_version, device_model, app_version, lang, first_seen, last_seen, hits
         FROM user_devices
         WHERE vpn_name=? AND revoked=0
         ORDER BY last_seen DESC
@@ -391,7 +474,7 @@ def get_devices_for_user(conn: sqlite3.Connection, vpn_name: str, limit: int = D
 def get_all_devices_for_user(conn: sqlite3.Connection, vpn_name: str, limit: int = 200):
     cur = conn.execute(
         """
-        SELECT device_key, hwid, user_agent, ip, first_seen, last_seen, hits
+        SELECT device_key, hwid, user_agent, ip, platform, os_name, os_version, device_model, app_version, lang, first_seen, last_seen, hits
         FROM user_devices
         WHERE vpn_name=? AND revoked=0
         ORDER BY last_seen DESC
@@ -437,6 +520,18 @@ def device_line_label(idx: int, hwid: str, ua: str):
     if not ua:
         return f"{idx}. Устройство"
     return f"{idx}. {ua.split(' ')[0][:18]}"
+
+
+def human_device_id(device_key: str, hwid: str):
+    h = (hwid or "").strip()
+    if h:
+        return h
+    k = (device_key or "").strip()
+    if not k:
+        return "—"
+    if k.startswith("fp:"):
+        return "fp_" + k[3:]
+    return k
 
 
 def get_user(conn: sqlite3.Connection, tg_id: int):
@@ -1324,13 +1419,20 @@ def show_my_devices(conn: sqlite3.Connection, msg: dict):
         return
     lines = [f"📱 Мои устройства ({len(rows)})", ""]
     for i, r in enumerate(rows, start=1):
-        _, hwid, ua, ip, first_seen, last_seen, hits = r
-        ident = (hwid or "").strip()
-        lines.append(f"{i}) ID: {_safe_text(ident or '—', 40)}")
+        device_key, hwid, ua, ip, platform, os_name, os_version, device_model, app_version, lang, first_seen, last_seen, hits = r
+        ident = human_device_id(device_key, hwid)
+        lines.append(f"{i}) ID: {_safe_text(ident, 40)}")
+        meta = " / ".join([x for x in [platform, os_name, os_version, device_model] if (x or "").strip()])
+        if meta:
+            lines.append(f"Устройство: {_safe_text(meta, 100)}")
         lines.append(f"Последняя активность: {_fmt_ts(int(last_seen or 0))}")
         lines.append(f"Первый раз: {_fmt_ts(int(first_seen or 0))}")
         if ip:
             lines.append(f"IP: {ip}")
+        if app_version:
+            lines.append(f"App: {_safe_text(app_version, 60)}")
+        if lang:
+            lines.append(f"Lang: {_safe_text(lang, 30)}")
         lines.append(f"User Agent: {_safe_text(ua, 140)}")
         lines.append(f"Запросов: {int(hits or 0)}")
         lines.append("")
@@ -1446,13 +1548,20 @@ def show_admin_user_devices(conn: sqlite3.Connection, msg: dict, vpn_name: str):
 
     lines = [f"📱 Устройства пользователя {header_user}", f"Показано: {len(rows)} (макс {DEVICE_LIST_LIMIT})", ""]
     for i, r in enumerate(rows, start=1):
-        device_key, hwid, ua, ip, first_seen, last_seen, hits = r
-        ident = hwid or device_key
+        device_key, hwid, ua, ip, platform, os_name, os_version, device_model, app_version, lang, first_seen, last_seen, hits = r
+        ident = human_device_id(device_key, hwid)
+        meta = " / ".join([x for x in [platform, os_name, os_version, device_model] if (x or "").strip()])
         lines.append(f"{i}) ID: {_safe_text(ident, 48)}")
+        if meta:
+            lines.append(f"Устройство: {_safe_text(meta, 120)}")
         lines.append(f"Дата подключения: {_fmt_ts(int(last_seen or 0))}")
         lines.append(f"Первый раз: {_fmt_ts(int(first_seen or 0))}")
         if ip:
             lines.append(f"IP: {ip}")
+        if app_version:
+            lines.append(f"App: {_safe_text(app_version, 60)}")
+        if lang:
+            lines.append(f"Lang: {_safe_text(lang, 30)}")
         lines.append(f"User Agent: {_safe_text(ua, 180)}")
         lines.append(f"Запросов: {int(hits or 0)}")
         lines.append("")
