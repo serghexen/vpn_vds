@@ -140,7 +140,7 @@ out['dup_emails'] = len([k for k, v in collections.Counter(emails).items() if v 
 out['clients_total'] = len(clients)
 
 docker_active = False
-r = run(['sh', '-lc', "docker ps --format '{{.Names}}' 2>/dev/null | grep -qx 'hexenvpn-xray'"])
+r = run(['sh', '-lc', 'docker ps --format \\'{{.Names}}\\' 2>/dev/null | grep -qx hexenvpn-xray'])
 if r.returncode == 0:
     docker_active = True
 
@@ -158,7 +158,7 @@ else:
 
 out['xray_active'] = bool(docker_active or systemd_active)
 
-r3 = run(['sh', '-lc', "ss -ltn 2>/dev/null | grep -q ':443 '"])
+r3 = run(['sh', '-lc', 'ss -ltn 2>/dev/null | grep -q :443'])
 out['port_443'] = (r3.returncode == 0)
 
 if check_user:
@@ -241,4 +241,3 @@ fi
 
 echo "RESULT: FAIL ($FAILS)"
 exit 2
-
