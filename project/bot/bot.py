@@ -73,6 +73,10 @@ LIVE_ONLINE_CACHE_TTL_SEC = int(os.environ.get("LIVE_ONLINE_CACHE_TTL_SEC", "20"
 TRAFFIC_COLLECT_ENABLED = os.environ.get("TRAFFIC_COLLECT_ENABLED", "1").strip() == "1"
 TRAFFIC_COLLECT_INTERVAL_SEC = int(os.environ.get("TRAFFIC_COLLECT_INTERVAL_SEC", "300"))
 TRAFFIC_RETENTION_DAYS = int(os.environ.get("TRAFFIC_RETENTION_DAYS", "14"))
+TRAFFIC_REPORT_ENABLED = os.environ.get("TRAFFIC_REPORT_ENABLED", "0").strip() == "1"
+TRAFFIC_REPORT_INTERVAL_SEC = int(os.environ.get("TRAFFIC_REPORT_INTERVAL_SEC", "300"))
+TRAFFIC_REPORT_HOUR = int(os.environ.get("TRAFFIC_REPORT_HOUR", "10"))
+TRAFFIC_REPORT_MINUTE = int(os.environ.get("TRAFFIC_REPORT_MINUTE", "0"))
 SSH_KEY_DEFAULT = "/root/.ssh/vless_sync_ed25519"
 SSH_KEY = os.environ.get("SSH_KEY", SSH_KEY_DEFAULT).strip() or SSH_KEY_DEFAULT
 UK_HOST = os.environ.get("UK_HOST", "").strip()
@@ -119,6 +123,8 @@ CB_ADMIN_ONLINE = "admin_online"
 CB_ADMIN_TRAFFIC = "admin_traffic"
 CB_ADMIN_TRAFFIC_PICK = "admin_traffic_pick"
 CB_ADMIN_TRAFFIC_REFRESH = "admin_traffic_refresh"
+CB_ADMIN_NODE_TRAFFIC = "admin_node_traffic"
+CB_ADMIN_NODE_TRAFFIC_REFRESH = "admin_node_traffic_refresh"
 CB_ADMIN_DIAG_UK = "admin_diag_uk"
 CB_ADMIN_DIAG_TR = "admin_diag_tr"
 CB_ADMIN_RESTART_UK = "admin_restart_uk"
@@ -278,6 +284,15 @@ def init_db(conn: sqlite3.Connection):
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bot_kv (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL DEFAULT '',
+            updated_at INTEGER NOT NULL
+        )
+        """
+    )
     # lightweight migration for existing DBs
     cols = [r[1] for r in conn.execute("PRAGMA table_info(user_devices)").fetchall()]
     if "revoked" not in cols:
@@ -301,6 +316,27 @@ def init_db(conn: sqlite3.Connection):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_traffic_samples_time ON traffic_samples(collected_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_traffic_samples_user ON traffic_samples(vpn_name, collected_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_traffic_samples_node ON traffic_samples(node, collected_at)")
+    conn.commit()
+
+
+def get_kv(conn: sqlite3.Connection, key: str, default: str = ""):
+    cur = conn.execute("SELECT value FROM bot_kv WHERE key=? LIMIT 1", ((key or "").strip(),))
+    row = cur.fetchone()
+    if not row:
+        return default
+    return str((row[0] or "").strip())
+
+
+def set_kv(conn: sqlite3.Connection, key: str, value: str):
+    now = int(time.time())
+    conn.execute(
+        """
+        INSERT INTO bot_kv (key, value, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+        """,
+        (((key or "").strip()), str(value or ""), now),
+    )
     conn.commit()
 
 
@@ -1008,6 +1044,106 @@ def get_traffic_user_breakdown(conn: sqlite3.Connection, vpn_name: str, hours: i
     }
 
 
+def _traffic_window_aggregate_by_node(conn: sqlite3.Connection, since_ts: int):
+    cur = conn.execute(
+        """
+        SELECT collected_at, node, node_host, vpn_name, uplink_total, downlink_total
+        FROM traffic_samples
+        WHERE collected_at >= ?
+        ORDER BY collected_at ASC
+        """,
+        (int(since_ts),),
+    )
+    prev = {}
+    out = {}
+    for collected_at, node, node_host, raw_name, up_total, down_total in cur.fetchall():
+        name = canonical_vpn_name(conn, (raw_name or "").strip())
+        if not name:
+            continue
+        node_label = _traffic_node_label(node, node_host)
+        key = (name, node_label)
+        up_total = int(up_total or 0)
+        down_total = int(down_total or 0)
+        p = prev.get(key)
+        if p is None:
+            prev[key] = (up_total, down_total)
+            continue
+        prev_up, prev_down = p
+        du = up_total - prev_up
+        dd = down_total - prev_down
+        if du < 0:
+            du = up_total
+        if dd < 0:
+            dd = down_total
+        if du < 0:
+            du = 0
+        if dd < 0:
+            dd = 0
+        prev[key] = (up_total, down_total)
+        rec = out.setdefault(node_label, {"uplink": 0, "downlink": 0, "users": set(), "last_ts": 0})
+        rec["uplink"] += du
+        rec["downlink"] += dd
+        if (du + dd) > 0:
+            rec["users"].add(name)
+            rec["last_ts"] = max(int(rec.get("last_ts") or 0), int(collected_at or 0))
+    rows = []
+    for node_label, rec in out.items():
+        up = int(rec.get("uplink") or 0)
+        down = int(rec.get("downlink") or 0)
+        total = up + down
+        rows.append(
+            {
+                "node": node_label,
+                "uplink": up,
+                "downlink": down,
+                "total": total,
+                "users": len(rec.get("users") or set()),
+                "last_ts": int(rec.get("last_ts") or 0),
+            }
+        )
+    rows.sort(key=lambda x: (x["total"], x["downlink"], x["uplink"]), reverse=True)
+    return rows
+
+
+def _month_start_ts_local(now_ts: int):
+    now_local = datetime.fromtimestamp(int(now_ts), tz=timezone.utc).astimezone()
+    start_local = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return int(start_local.timestamp())
+
+
+def build_node_traffic_report_text(conn: sqlite3.Connection, now_ts: int | None = None):
+    ts = int(now_ts or time.time())
+    now_local = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone()
+    since_24h = ts - 86400
+    since_month = _month_start_ts_local(ts)
+
+    day_rows = _traffic_window_aggregate_by_node(conn, since_24h)
+    month_rows = _traffic_window_aggregate_by_node(conn, since_month)
+
+    def section(title: str, rows: list[dict], since_ts: int):
+        lines = [title]
+        if not rows:
+            lines.append("данных нет")
+            return lines
+        sum_up = sum(int(r.get("uplink") or 0) for r in rows)
+        sum_down = sum(int(r.get("downlink") or 0) for r in rows)
+        sum_total = sum_up + sum_down
+        lines.append(f"Итого: ↓{_fmt_bytes(sum_down)} ↑{_fmt_bytes(sum_up)} Σ{_fmt_bytes(sum_total)}")
+        for r in rows:
+            lines.append(
+                f"- {r['node']}: ↓{_fmt_bytes(r['downlink'])} ↑{_fmt_bytes(r['uplink'])} Σ{_fmt_bytes(r['total'])} | users={int(r['users'])}"
+            )
+        lines.append(f"Начало окна: {_fmt_ts(int(since_ts))}")
+        return lines
+
+    lines = ["📈 Трафик по узлам", f"Сформирован: {now_local.strftime('%d.%m.%Y %H:%M')}"]
+    lines.append("")
+    lines.extend(section("За 24 часа:", day_rows, since_24h))
+    lines.append("")
+    lines.extend(section("С начала месяца:", month_rows, since_month))
+    return "\n".join(lines)[:3500]
+
+
 def get_all_devices_for_user(conn: sqlite3.Connection, vpn_name: str, limit: int = 200):
     cur = conn.execute(
         """
@@ -1526,6 +1662,37 @@ def replica_monitor_loop():
         time.sleep(max(30, REPLICA_MONITOR_INTERVAL_SEC))
 
 
+def traffic_report_loop():
+    if not TRAFFIC_REPORT_ENABLED:
+        print("[traffic-report] disabled", file=sys.stderr, flush=True)
+        return
+    conn = sqlite3.connect(DB_PATH)
+    init_db(conn)
+    print(
+        f"[traffic-report] enabled interval={TRAFFIC_REPORT_INTERVAL_SEC}s at={TRAFFIC_REPORT_HOUR:02d}:{TRAFFIC_REPORT_MINUTE:02d}",
+        file=sys.stderr,
+        flush=True,
+    )
+    while True:
+        try:
+            now_ts = int(time.time())
+            now_local = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone()
+            today = now_local.strftime("%Y-%m-%d")
+            last_sent = get_kv(conn, "traffic_report_last_date", default="")
+            if (now_local.hour > TRAFFIC_REPORT_HOUR) or (
+                now_local.hour == TRAFFIC_REPORT_HOUR and now_local.minute >= TRAFFIC_REPORT_MINUTE
+            ):
+                if last_sent != today:
+                    text = build_node_traffic_report_text(conn, now_ts=now_ts)
+                    send_admin_alert(text)
+                    set_kv(conn, "traffic_report_last_date", today)
+                    print(f"[traffic-report] sent date={today}", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[traffic-report-loop-error] {e}", file=sys.stderr, flush=True)
+            traceback.print_exc()
+        time.sleep(max(60, TRAFFIC_REPORT_INTERVAL_SEC))
+
+
 def trial_notice_loop():
     conn = sqlite3.connect(DB_PATH)
     init_db(conn)
@@ -1916,6 +2083,7 @@ def kb_admin_service():
                 {"text": "🟢 Онлайн сессии", "callback_data": CB_ADMIN_ONLINE},
             ],
             [{"text": "📊 Трафик (24ч)", "callback_data": CB_ADMIN_TRAFFIC}],
+            [{"text": "📈 Трафик узлов", "callback_data": CB_ADMIN_NODE_TRAFFIC}],
             [
                 {"text": "🔍 Диаг UK", "callback_data": CB_ADMIN_DIAG_UK},
                 {"text": "🔍 Диаг TR", "callback_data": CB_ADMIN_DIAG_TR},
@@ -1937,6 +2105,15 @@ def kb_admin_traffic():
                 {"text": "👤 Пользователь", "callback_data": CB_ADMIN_TRAFFIC_PICK},
                 {"text": "🔄 Обновить", "callback_data": CB_ADMIN_TRAFFIC_REFRESH},
             ],
+            [{"text": "⬅️ Вернуться назад", "callback_data": CB_ADMIN_SERVICE}],
+        ]
+    }
+
+
+def kb_admin_node_traffic():
+    return {
+        "inline_keyboard": [
+            [{"text": "🔄 Обновить", "callback_data": CB_ADMIN_NODE_TRAFFIC_REFRESH}],
             [{"text": "⬅️ Вернуться назад", "callback_data": CB_ADMIN_SERVICE}],
         ]
     }
@@ -2304,6 +2481,16 @@ def show_admin_traffic(conn: sqlite3.Connection, msg: dict, hours: int = 24):
     lines.append("")
     lines.append("Нажми «👤 Пользователь», чтобы открыть деталку.")
     send_message(chat_id, "\n".join(lines)[:3500], kb_admin_traffic())
+
+
+def show_admin_node_traffic(conn: sqlite3.Connection, msg: dict):
+    user = msg["from"]
+    chat_id = msg["chat"]["id"]
+    if not is_admin_user(user):
+        send_message(chat_id, "Эта команда только для администратора.", kb_main(is_admin=False))
+        return
+    text = build_node_traffic_report_text(conn)
+    send_message(chat_id, text, kb_admin_node_traffic())
 
 
 def show_admin_user_traffic(conn: sqlite3.Connection, msg: dict, vpn_name: str, hours: int = 24):
@@ -2862,6 +3049,18 @@ def dispatch_action(conn: sqlite3.Connection, msg: dict, action: str):
             return
         clear_admin_state(conn, tg_id)
         show_admin_traffic(conn, msg, hours=24)
+    elif action == CB_ADMIN_NODE_TRAFFIC:
+        if not is_admin_user(user):
+            send_message(chat_id, "Эта команда только для администратора.", kb_main(is_admin=False))
+            return
+        clear_admin_state(conn, tg_id)
+        show_admin_node_traffic(conn, msg)
+    elif action == CB_ADMIN_NODE_TRAFFIC_REFRESH:
+        if not is_admin_user(user):
+            send_message(chat_id, "Эта команда только для администратора.", kb_main(is_admin=False))
+            return
+        clear_admin_state(conn, tg_id)
+        show_admin_node_traffic(conn, msg)
     elif action == CB_ADMIN_DIAG_UK:
         if not is_admin_user(user):
             send_message(chat_id, "Эта команда только для администратора.", kb_main(is_admin=False))
@@ -2962,6 +3161,8 @@ def main_loop():
     monitor.start()
     replica_monitor = Thread(target=replica_monitor_loop, daemon=True)
     replica_monitor.start()
+    traffic_reporter = Thread(target=traffic_report_loop, daemon=True)
+    traffic_reporter.start()
     trial_notifier = Thread(target=trial_notice_loop, daemon=True)
     trial_notifier.start()
     traffic_collector = Thread(target=traffic_collect_loop, daemon=True)

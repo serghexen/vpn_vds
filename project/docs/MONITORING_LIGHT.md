@@ -5,6 +5,7 @@
 ## Что добавлено
 - Скрипт метрик: `project/scripts/metrics_master_light.sh`
 - В админке бота: кнопка `📊 Состояние узла`
+- В админке бота: кнопка `📈 Трафик узлов` (за 24ч и с начала месяца)
 - Команда бота: `/health` (только для админа)
 - Отдельный healthcheck реплик: `project/scripts/healthcheck_replica.sh`
 
@@ -61,3 +62,18 @@ docker compose -f project/docker-compose.master-full.yml up -d --no-deps --build
 - по UK;
 - по TR;
 - отдельные сообщения о восстановлении каждой реплики.
+
+## Авто-отчет по трафику узлов (опционально)
+
+В `project/env/bot.env`:
+```env
+TRAFFIC_REPORT_ENABLED=1
+TRAFFIC_REPORT_INTERVAL_SEC=300
+TRAFFIC_REPORT_HOUR=10
+TRAFFIC_REPORT_MINUTE=0
+```
+
+Что делает:
+- бот раз в день после указанного времени отправляет админам отчет по узлам:
+  - трафик за 24 часа;
+  - трафик с начала текущего месяца.
