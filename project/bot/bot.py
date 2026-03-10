@@ -534,6 +534,62 @@ def human_device_id(device_key: str, hwid: str):
     return k
 
 
+ANDROID_MODEL_MAP = {
+    "SM-S916B": "Samsung Galaxy S23+",
+}
+
+
+def _guess_os_from_ua(ua: str):
+    u = (ua or "").lower()
+    if "android" in u:
+        return "Android"
+    if "iphone" in u or "ipad" in u or "/ios" in u or " ios " in u:
+        return "iOS"
+    if "windows" in u:
+        return "Windows"
+    if "mac os" in u or "macintosh" in u:
+        return "macOS"
+    return ""
+
+
+def _human_model(model: str):
+    m = (model or "").strip()
+    if not m:
+        return ""
+    up = m.upper()
+    if up in ANDROID_MODEL_MAP:
+        return ANDROID_MODEL_MAP[up]
+    if up.startswith("SM-"):
+        return f"Samsung {up}"
+    return m
+
+
+def human_device_title(platform: str, os_name: str, os_version: str, device_model: str, ua: str):
+    p = (platform or "").strip()
+    o = (os_name or "").strip()
+    v = (os_version or "").strip()
+    m = _human_model(device_model)
+
+    if not o:
+        o = _guess_os_from_ua(ua)
+    if not p and o:
+        p = o
+
+    os_part = o
+    if v:
+        os_part = f"{o} {v}".strip()
+
+    if m and os_part:
+        return f"{m} ({os_part})"
+    if m:
+        return m
+    if os_part:
+        return os_part
+    if p:
+        return p
+    return ""
+
+
 def get_user(conn: sqlite3.Connection, tg_id: int):
     cur = conn.execute(
         "SELECT tg_id, username, vpn_name, created_at, last_start_at FROM tg_users WHERE tg_id=?",
@@ -1421,10 +1477,10 @@ def show_my_devices(conn: sqlite3.Connection, msg: dict):
     for i, r in enumerate(rows, start=1):
         device_key, hwid, ua, ip, platform, os_name, os_version, device_model, app_version, lang, first_seen, last_seen, hits = r
         ident = human_device_id(device_key, hwid)
+        title = human_device_title(platform, os_name, os_version, device_model, ua)
         lines.append(f"{i}) ID: {_safe_text(ident, 40)}")
-        meta = " / ".join([x for x in [platform, os_name, os_version, device_model] if (x or "").strip()])
-        if meta:
-            lines.append(f"Устройство: {_safe_text(meta, 100)}")
+        if title:
+            lines.append(f"Устройство: {_safe_text(title, 100)}")
         lines.append(f"Последняя активность: {_fmt_ts(int(last_seen or 0))}")
         lines.append(f"Первый раз: {_fmt_ts(int(first_seen or 0))}")
         if ip:
@@ -1550,10 +1606,10 @@ def show_admin_user_devices(conn: sqlite3.Connection, msg: dict, vpn_name: str):
     for i, r in enumerate(rows, start=1):
         device_key, hwid, ua, ip, platform, os_name, os_version, device_model, app_version, lang, first_seen, last_seen, hits = r
         ident = human_device_id(device_key, hwid)
-        meta = " / ".join([x for x in [platform, os_name, os_version, device_model] if (x or "").strip()])
+        title = human_device_title(platform, os_name, os_version, device_model, ua)
         lines.append(f"{i}) ID: {_safe_text(ident, 48)}")
-        if meta:
-            lines.append(f"Устройство: {_safe_text(meta, 120)}")
+        if title:
+            lines.append(f"Устройство: {_safe_text(title, 120)}")
         lines.append(f"Дата подключения: {_fmt_ts(int(last_seen or 0))}")
         lines.append(f"Первый раз: {_fmt_ts(int(first_seen or 0))}")
         if ip:
