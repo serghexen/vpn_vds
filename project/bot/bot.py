@@ -1303,7 +1303,13 @@ def show_admin_devices_overview(conn: sqlite3.Connection, msg: dict):
         lines.append("")
         lines.append("Топ пользователей по числу устройств:")
         for i, r in enumerate(rows, start=1):
-            lines.append(f"{i}. {r[0]} — {int(r[1])} шт. (последняя активность: {_fmt_ts(int(r[2] or 0))})")
+            vpn_name = (r[0] or "").strip()
+            disp = display_name_for(conn, vpn_name) or vpn_name
+            if disp != vpn_name:
+                who = f"{disp} ({vpn_name})"
+            else:
+                who = vpn_name
+            lines.append(f"{i}. {who} — {int(r[1])} шт. (последняя активность: {_fmt_ts(int(r[2] or 0))})")
     else:
         lines.append("\nПока нет данных. Устройства появятся после запросов к /sub/*.")
     lines.append("\nВыбери пользователя через «🔎 Поиск», чтобы посмотреть детали.")
@@ -1318,11 +1324,16 @@ def show_admin_user_devices(conn: sqlite3.Connection, msg: dict, vpn_name: str):
         print(f"[device-ingest-error] {e}", file=sys.stderr, flush=True)
 
     rows = get_devices_for_user(conn, vpn_name, limit=DEVICE_LIST_LIMIT)
+    disp = display_name_for(conn, vpn_name) or vpn_name
+    if disp != vpn_name:
+        header_user = f"{disp} ({vpn_name})"
+    else:
+        header_user = vpn_name
     if not rows:
-        send_message(chat_id, f"📱 Устройства пользователя {vpn_name}\n\nДанных пока нет.", kb_admin_service())
+        send_message(chat_id, f"📱 Устройства пользователя {header_user}\n\nДанных пока нет.", kb_admin_service())
         return
 
-    lines = [f"📱 Устройства пользователя {vpn_name}", f"Показано: {len(rows)} (макс {DEVICE_LIST_LIMIT})", ""]
+    lines = [f"📱 Устройства пользователя {header_user}", f"Показано: {len(rows)} (макс {DEVICE_LIST_LIMIT})", ""]
     for i, r in enumerate(rows, start=1):
         device_key, hwid, ua, ip, first_seen, last_seen, hits = r
         ident = hwid or device_key
