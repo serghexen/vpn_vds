@@ -59,6 +59,7 @@ DEVICE_LOG_PATH = os.environ.get("DEVICE_LOG_PATH", "/var/log/nginx/sub_access.l
 DEVICE_BOOTSTRAP_BYTES = int(os.environ.get("DEVICE_BOOTSTRAP_BYTES", str(2 * 1024 * 1024)))
 DEVICE_LIST_LIMIT = int(os.environ.get("DEVICE_LIST_LIMIT", "12"))
 DEVICE_SOFT_LIMIT = int(os.environ.get("DEVICE_SOFT_LIMIT", "5"))
+ONLINE_WINDOW_SEC = int(os.environ.get("ONLINE_WINDOW_SEC", "900"))
 ADMIN_TG_IDS = parse_int_set(os.environ.get("ADMIN_TG_IDS", ""))
 ADMIN_TG_USERNAMES = parse_str_set(os.environ.get("ADMIN_TG_USERNAMES", ""))
 PRIMARY_ADMIN_TG_ID = int(os.environ.get("PRIMARY_ADMIN_TG_ID", "227380225"))
@@ -299,6 +300,47 @@ def count_active_devices(conn: sqlite3.Connection, vpn_name: str):
     cur = conn.execute(
         "SELECT COUNT(*) FROM user_devices WHERE vpn_name=? AND revoked=0 AND pending=0",
         (vpn_name,),
+    )
+    row = cur.fetchone()
+    return int((row or [0])[0] or 0)
+
+
+def user_last_seen_ts(conn: sqlite3.Connection, vpn_name: str):
+    cur = conn.execute(
+        "SELECT MAX(last_seen) FROM user_devices WHERE vpn_name=? AND revoked=0",
+        (vpn_name,),
+    )
+    row = cur.fetchone()
+    return int((row or [0])[0] or 0)
+
+
+def is_user_online(last_seen_ts: int):
+    if int(last_seen_ts or 0) <= 0:
+        return False
+    return (int(time.time()) - int(last_seen_ts)) <= ONLINE_WINDOW_SEC
+
+
+def online_label(last_seen_ts: int):
+    if is_user_online(last_seen_ts):
+        return "🟢 онлайн"
+    return "⚪ офлайн"
+
+
+def online_users_count(conn: sqlite3.Connection):
+    now = int(time.time())
+    threshold = now - ONLINE_WINDOW_SEC
+    cur = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM (
+          SELECT vpn_name, MAX(last_seen) AS mx
+          FROM user_devices
+          WHERE revoked=0
+          GROUP BY vpn_name
+        ) t
+        WHERE mx >= ?
+        """,
+        (threshold,),
     )
     row = cur.fetchone()
     return int((row or [0])[0] or 0)
@@ -1675,7 +1717,12 @@ def show_admin_devices_overview(conn: sqlite3.Connection, msg: dict):
         print(f"[device-ingest-error] {e}", file=sys.stderr, flush=True)
         parsed = 0
     rows = get_device_stats_by_user(conn, limit=12)
-    lines = [f"📱 Устройства (сбор без лимитов)\nОбновлено записей: {parsed}"]
+    online_total = online_users_count(conn)
+    lines = [
+        f"📱 Устройства (сбор без лимитов)",
+        f"Обновлено записей: {parsed}",
+        f"Онлайн сейчас (окно {int(ONLINE_WINDOW_SEC/60)} мин): {online_total}",
+    ]
     if rows:
         lines.append("")
         lines.append("Топ пользователей по числу устройств:")
@@ -1686,9 +1733,10 @@ def show_admin_devices_overview(conn: sqlite3.Connection, msg: dict):
                 who = f"{disp} ({vpn_name})"
             else:
                 who = vpn_name
+            last_seen = int(r[3] or 0)
             lines.append(
                 f"{i}. {who} — активных {int(r[1] or 0)}, в ожидании {int(r[2] or 0)} "
-                f"(последняя активность: {_fmt_ts(int(r[3] or 0))})"
+                f"({online_label(last_seen)}, последняя активность: {_fmt_ts(last_seen)})"
             )
     else:
         lines.append("\nПока нет данных. Устройства появятся после запросов к /sub/*.")
