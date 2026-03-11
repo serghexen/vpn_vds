@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import base64
 import json
 import os
 import re
@@ -46,6 +47,7 @@ FREE_DAYS = int(os.environ.get("FREE_DAYS", "1"))
 START_RATE_LIMIT_SEC = int(os.environ.get("START_RATE_LIMIT_SEC", "30"))
 DB_PATH = os.environ.get("DB_PATH", "/var/lib/hexenvpn-bot/bot.db")
 CLIENTS_JSON = os.environ.get("CLIENTS_JSON", "/var/lib/vless-sub/clients.json")
+SUB_DIR = os.environ.get("SUB_DIR", "/var/www/sub")
 ADD_USER_CMD = os.environ.get("ADD_USER_CMD", "/usr/local/sbin/vless-add-user")
 DEL_USER_CMD = os.environ.get("DEL_USER_CMD", "/usr/local/sbin/vless-del-user")
 SYNC_EXPIRE_CMD = os.environ.get("SYNC_EXPIRE_CMD", "/usr/local/sbin/vless-sync-expire")
@@ -1983,7 +1985,123 @@ def set_user_blocked(name: str, blocked: bool = True):
     rc, out = sync_expire_apply()
     if rc != 0:
         return False, f"Статус изменен, но sync завершился с ошибкой:\n{out}"
+    errs = sync_block_state_on_replicas(name, blocked)
+    if errs:
+        return False, "Статус изменен на мастере, но не синхронизирован на реплики:\n" + "\n".join(errs)
     return True, "OK"
+
+
+def _read_sub_payload_for_user(vpn_name: str):
+    row = get_client_by_name(vpn_name)
+    if not row:
+        return ""
+    token = (row.get("token") or "").strip()
+    paths = []
+    if token:
+        paths.append(Path(SUB_DIR) / token)
+    paths.append(Path(SUB_DIR) / vpn_name)
+    for p in paths:
+        if not p.exists():
+            continue
+        try:
+            raw = p.read_text(encoding="utf-8").strip()
+            if not raw:
+                continue
+            return base64.b64decode(raw).decode("utf-8", errors="ignore")
+        except Exception:
+            continue
+    return ""
+
+
+def _extract_replica_uuids(vpn_name: str):
+    payload = _read_sub_payload_for_user(vpn_name)
+    out = {}
+    if not payload:
+        return out
+    for line in payload.splitlines():
+        m = re.match(r"^vless://([0-9a-fA-F-]{36})@([^:/?#]+)", (line or "").strip())
+        if not m:
+            continue
+        uid = m.group(1).strip()
+        host = m.group(2).strip()
+        if UK_HOST and host == UK_HOST:
+            out["uk"] = uid
+        if TR_HOST and host == TR_HOST:
+            out["tr"] = uid
+    return out
+
+
+def _sync_block_state_one_replica(host: str, vpn_name: str, user_uuid: str, blocked: bool):
+    blocked_int = "1" if blocked else "0"
+    remote_cmd = (
+        f"UUID={shlex.quote(user_uuid)} NAME={shlex.quote(vpn_name.lower())} BLOCKED={blocked_int} python3 - <<'PY'\n"
+        "import json, os\n"
+        "p='/usr/local/etc/xray/config.json'\n"
+        "cfg=json.load(open(p,'r',encoding='utf-8'))\n"
+        "uuid=os.environ['UUID'].strip()\n"
+        "name=os.environ['NAME'].strip().lower()\n"
+        "blocked=os.environ.get('BLOCKED','0') == '1'\n"
+        "ib=None\n"
+        "for x in cfg.get('inbounds',[]):\n"
+        "    if x.get('protocol')=='vless':\n"
+        "        ib=x\n"
+        "        break\n"
+        "if ib is None:\n"
+        "    raise SystemExit('no vless inbound found')\n"
+        "cur=ib.setdefault('settings',{}).setdefault('clients',[])\n"
+        "if blocked:\n"
+        "    new=[c for c in cur if (c.get('id') or '').strip()!=uuid and (c.get('email') or '').strip().lower()!=name]\n"
+        "else:\n"
+        "    new=[c for c in cur if (c.get('id') or '').strip()!=uuid and (c.get('email') or '').strip().lower()!=name]\n"
+        "    new.append({'id': uuid, 'flow': 'xtls-rprx-vision', 'email': name})\n"
+        "ib['settings']['clients']=new\n"
+        "json.dump(cfg,open(p,'w',encoding='utf-8'),ensure_ascii=False,indent=2)\n"
+        "open(p,'a',encoding='utf-8').write('\\n')\n"
+        "os.chmod(p, 0o644)\n"
+        "cnt=sum(1 for c in new if ((c.get('email') or '').strip().lower()==name))\n"
+        "print('COUNT', cnt)\n"
+        "PY\n"
+        "if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx hexenvpn-xray; then\n"
+        "  docker exec hexenvpn-xray xray run -test -config /usr/local/etc/xray/config.json >/dev/null\n"
+        "  docker restart hexenvpn-xray >/dev/null\n"
+        "else\n"
+        "  /usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json >/dev/null\n"
+        "  systemctl restart xray\n"
+        "fi"
+    )
+    args = [
+        "ssh",
+        "-i",
+        SSH_KEY,
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "ConnectTimeout=10",
+        f"root@{host}",
+        remote_cmd,
+    ]
+    return run_cmd(args, timeout_sec=45)
+
+
+def sync_block_state_on_replicas(vpn_name: str, blocked: bool):
+    errs = []
+    uuids = _extract_replica_uuids(vpn_name)
+    nodes = []
+    if UK_HOST:
+        nodes.append(("UK", UK_HOST, uuids.get("uk", "")))
+    if TR_HOST:
+        nodes.append(("TR", TR_HOST, uuids.get("tr", "")))
+    for label, host, uid in nodes:
+        if not uid:
+            errs.append(f"{label}: не найден UUID в подписке пользователя")
+            continue
+        rc, out = _sync_block_state_one_replica(host, vpn_name, uid, blocked)
+        if rc != 0:
+            short = (out or f"rc={rc}").strip().replace("\n", " ")
+            errs.append(f"{label}: {short[:220]}")
+    return errs
 
 
 def find_subscription_info(vpn_name: str):

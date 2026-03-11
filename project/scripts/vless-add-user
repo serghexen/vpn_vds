@@ -191,9 +191,15 @@ for ib in cfg.get('inbounds',[]):
     ib.setdefault('settings',{})['clients']=[c for c in cur if c.get('id')!=uuid]
 json.dump(cfg,open(p,'w',encoding='utf-8'),ensure_ascii=False,indent=2)
 open(p,'a',encoding='utf-8').write('\\n')
+os.chmod(p, 0o644)
 PY
-/usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json >/dev/null
-systemctl restart xray" || true
+if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx hexenvpn-xray; then
+  docker exec hexenvpn-xray xray run -test -config /usr/local/etc/xray/config.json >/dev/null
+  docker restart hexenvpn-xray >/dev/null
+else
+  /usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json >/dev/null
+  systemctl restart xray
+fi" || true
   fi
 
   if [[ "$REMOTE_TR_ADDED" -eq 1 && -n "$TR_HOST" ]]; then
@@ -209,9 +215,15 @@ for ib in cfg.get('inbounds',[]):
     ib.setdefault('settings',{})['clients']=[c for c in cur if c.get('id')!=uuid]
 json.dump(cfg,open(p,'w',encoding='utf-8'),ensure_ascii=False,indent=2)
 open(p,'a',encoding='utf-8').write('\\n')
+os.chmod(p, 0o644)
 PY
-/usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json >/dev/null
-systemctl restart xray" || true
+if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx hexenvpn-xray; then
+  docker exec hexenvpn-xray xray run -test -config /usr/local/etc/xray/config.json >/dev/null
+  docker restart hexenvpn-xray >/dev/null
+else
+  /usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json >/dev/null
+  systemctl restart xray
+fi" || true
   fi
 
   echo "Rollback complete." >&2
@@ -273,10 +285,16 @@ if not added:
 with open(p,'w',encoding='utf-8') as f:
     json.dump(cfg,f,ensure_ascii=False,indent=2)
     f.write('\\n')
+os.chmod(p, 0o644)
 print('OK', uuid)
 PY
-/usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json >/dev/null
-systemctl restart xray"
+if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx hexenvpn-xray; then
+  docker exec hexenvpn-xray xray run -test -config /usr/local/etc/xray/config.json >/dev/null
+  docker restart hexenvpn-xray >/dev/null
+else
+  /usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json >/dev/null
+  systemctl restart xray
+fi"
 }
 
 # backups before any mutation
@@ -436,6 +454,7 @@ encoded = base64.b64encode(payload.encode('utf-8')).decode('ascii')
 
 clients_path.write_text(json.dumps(clients, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
 xray_path.write_text(json.dumps(xray, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+os.chmod(xray_path, 0o644)
 (sub_dir / token).write_text(encoded, encoding='utf-8')
 (sub_dir / name).write_text(encoded, encoding='utf-8')
 

@@ -124,7 +124,7 @@ check_replica() {
   [[ -z "$host" ]] && return 0
   echo "== Replica $host =="
   local out rc
-  out="$(ssh -i "$SSH_KEY" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 "root@$host" "python3 - <<'PY'
+out="$(ssh -i "$SSH_KEY" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 "root@$host" "python3 - <<'PY'
 import json, collections, subprocess
 cfg=json.load(open('/usr/local/etc/xray/config.json','r',encoding='utf-8'))
 clients=[c for ib in cfg.get('inbounds',[]) if ib.get('protocol')=='vless' for c in ib.get('settings',{}).get('clients',[])]
@@ -132,19 +132,20 @@ ids=[(c.get('id') or '').strip() for c in clients if c.get('id')]
 emails=[(c.get('email') or '').strip().lower() for c in clients if c.get('email')]
 dup_ids=len([k for k,v in collections.Counter(ids).items() if v>1])
 dup_em=len([k for k,v in collections.Counter(emails).items() if v>1])
-active=subprocess.run(['systemctl','is-active','xray'], capture_output=True, text=True).stdout.strip()
-print(active, dup_ids, dup_em, len(clients))
+print(dup_ids, dup_em, len(clients))
 PY")" || rc=$?
   if [[ "${rc:-0}" != "0" ]]; then
     fail "replica $host unreachable via SSH key $SSH_KEY"
     return 0
   fi
-  local active d1 d2 total
-  read -r active d1 d2 total <<<"$out"
+  local d1 d2 total
+  read -r d1 d2 total <<<"$out"
+  local active runtime
+  read -r active runtime <<<"$(ssh -i "$SSH_KEY" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 "root@$host" "if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx hexenvpn-xray; then echo active docker; elif [ \"\$(systemctl is-active xray 2>/dev/null || true)\" = active ]; then echo active systemd; else echo inactive unknown; fi" 2>/dev/null || echo "inactive unknown")"
   if [[ "$active" == "active" ]]; then
-    ok "replica $host xray active"
+    ok "replica $host xray active (runtime=$runtime)"
   else
-    fail "replica $host xray status=$active"
+    fail "replica $host xray status=$active (runtime=$runtime)"
   fi
   if [[ "$d1" == "0" && "$d2" == "0" ]]; then
     ok "replica $host duplicates: none (clients=$total)"

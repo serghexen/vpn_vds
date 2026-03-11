@@ -1,0 +1,16 @@
+services:
+  xray:
+    image: ghcr.io/xtls/xray-core:latest
+    container_name: hexenvpn-xray
+    restart: unless-stopped
+    command: ["run", "-config", "/usr/local/etc/xray/config.json"]
+    ports:
+      - "443:443/tcp"
+    volumes:
+      - /usr/local/etc/xray:/usr/local/etc/xray
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+

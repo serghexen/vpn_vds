@@ -124,10 +124,16 @@ for ib in cfg.get('inbounds',[]):
     ib.setdefault('settings',{})['clients']=new
 json.dump(cfg,open(p,'w',encoding='utf-8'),ensure_ascii=False,indent=2)
 open(p,'a',encoding='utf-8').write('\\n')
+os.chmod(p, 0o644)
 print('REMOVED', removed)
 PY
-/usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json >/dev/null
-systemctl restart xray" | tail -n1
+if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx hexenvpn-xray; then
+  docker exec hexenvpn-xray xray run -test -config /usr/local/etc/xray/config.json >/dev/null
+  docker restart hexenvpn-xray >/dev/null
+else
+  /usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json >/dev/null
+  systemctl restart xray
+fi" | tail -n1
 }
 
 add_remote_uuid() {
@@ -152,9 +158,15 @@ for ib in cfg.get('inbounds',[]):
     break
 json.dump(cfg,open(p,'w',encoding='utf-8'),ensure_ascii=False,indent=2)
 open(p,'a',encoding='utf-8').write('\\n')
+os.chmod(p, 0o644)
 PY
-/usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json >/dev/null
-systemctl restart xray"
+if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx hexenvpn-xray; then
+  docker exec hexenvpn-xray xray run -test -config /usr/local/etc/xray/config.json >/dev/null
+  docker restart hexenvpn-xray >/dev/null
+else
+  /usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json >/dev/null
+  systemctl restart xray
+fi"
 }
 
 cleanup_on_error() {
@@ -291,6 +303,7 @@ for ib in xray.get('inbounds', []):
     ib.setdefault('settings', {})['clients'] = [c for c in cur if c.get('id') != uuid]
 
 xray_path.write_text(json.dumps(xray, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+xray_path.chmod(0o644)
 PY
 
 rm -f "$SUB_DIR/$U_TOKEN" "$SUB_DIR/$U_NAME" || true

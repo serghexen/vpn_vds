@@ -11,8 +11,8 @@
 - [ ] UX (админ): карточка пользователя (срок/статус/узлы + быстрые действия).
 - [ ] UX (админ): журнал админ-действий в SQLite (`add/edit/block/unblock/del`).
 - [ ] Миграция реплик на Docker Compose:
-- [ ] Миграция реплик: подготовить `docker-compose` профиль для ноды (xray + volumes + restart policy).
-- [ ] Миграция реплик: безопасный runbook поэтапного перевода UK (backup -> precheck -> switch -> postcheck -> rollback).
+- [x] Миграция реплик: подготовить `docker-compose` профиль для ноды (xray + volumes + restart policy).
+- [x] Миграция реплик: безопасный runbook поэтапного перевода UK (backup -> precheck -> switch -> postcheck -> rollback).
 - [ ] Миграция реплик: повторить на TR после стабилизации UK.
 - [ ] Миграция реплик: проверить совместимость `vless-*`/sync-скриптов при docker-runtime на репликах.
 - [ ] Архитектура v2: оставить текущий режим (`xray + bot + subscription` на мастере) как baseline.

@@ -65,6 +65,10 @@
 Для миграции используется compose-файл:
 - `project/docker-compose.master-full.yml`
 
+## Миграция xray на репликах (UK/TR)
+Безопасный поэтапный runbook для перевода реплик из systemd в Docker:
+- `project/docs/MIGRATION_REPLICA_DOCKER.md`
+
 ## Развертывание на чистой VDS (автоматизация)
 Полный bootstrap-сценарий для нового сервера:
 - `project/docs/CLEAN_VDS_BOOTSTRAP.md`

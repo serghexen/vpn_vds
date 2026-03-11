@@ -163,6 +163,7 @@ else:
 backup_path = xray_path.with_name(xray_path.name + '.sync.bak')
 shutil.copy2(xray_path, backup_path)
 shutil.move(tmp_name, xray_path)
+os.chmod(xray_path, 0o644)
 
 if xray_autoreload:
     print('RELOAD managed by autoreload mode, systemctl restart skipped')
