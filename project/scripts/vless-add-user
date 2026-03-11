@@ -28,10 +28,21 @@ TR_FP="${TR_FP:-firefox}"
 TR_SPX="${TR_SPX:-/}"
 
 SSH_KEY="${SSH_KEY:-/root/.ssh/vless_sync_ed25519}"
+SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-10}"
+SSH_SERVER_ALIVE_INTERVAL="${SSH_SERVER_ALIVE_INTERVAL:-10}"
+SSH_SERVER_ALIVE_COUNT_MAX="${SSH_SERVER_ALIVE_COUNT_MAX:-3}"
+REMOTE_OP_TIMEOUT="${REMOTE_OP_TIMEOUT:-45}"
 LOCK_FILE="/var/lock/vless-add-user.lock"
 XRAY_BIN="${XRAY_BIN:-/usr/local/bin/xray}"
 XRAY_AUTORELOAD="${XRAY_AUTORELOAD:-0}"
 XRAY_RESTART_CMD="${XRAY_RESTART_CMD:-}"
+SSH_BASE=(ssh -n -i "${SSH_KEY}" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout="${SSH_CONNECT_TIMEOUT}" -o ServerAliveInterval="${SSH_SERVER_ALIVE_INTERVAL}" -o ServerAliveCountMax="${SSH_SERVER_ALIVE_COUNT_MAX}")
+
+remote_exec() {
+  local host="$1"
+  local payload="$2"
+  timeout "${REMOTE_OP_TIMEOUT}" "${SSH_BASE[@]}" "root@${host}" "$payload"
+}
 
 restart_local_xray() {
   if [[ -n "$XRAY_RESTART_CMD" ]]; then
@@ -43,7 +54,7 @@ restart_local_xray() {
     return
   fi
   if command -v systemctl >/dev/null 2>&1; then
-    systemctl restart xray
+    timeout 25 systemctl restart xray
     return
   fi
   echo "WARN: no xray restart method available" >&2
@@ -179,7 +190,7 @@ cleanup_on_error() {
   fi
 
   if [[ "$REMOTE_UK_ADDED" -eq 1 && -n "$UK_HOST" ]]; then
-    ssh -i "${SSH_KEY}" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 "root@${UK_HOST}" "UUID='${UK_UUID}' NAME='${NAME}' python3 - <<'PY'
+    remote_exec "${UK_HOST}" "UUID='${UK_UUID}' NAME='${NAME}' python3 - <<'PY'
 import os, json
 p='/usr/local/etc/xray/config.json'
 cfg=json.load(open(p,'r',encoding='utf-8'))
@@ -194,16 +205,16 @@ open(p,'a',encoding='utf-8').write('\\n')
 os.chmod(p, 0o644)
 PY
 if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx hexenvpn-xray; then
-  docker exec hexenvpn-xray xray run -test -config /usr/local/etc/xray/config.json >/dev/null
-  docker restart hexenvpn-xray >/dev/null
+  timeout 20 docker exec hexenvpn-xray xray run -test -config /usr/local/etc/xray/config.json >/dev/null
+  timeout 25 docker restart hexenvpn-xray >/dev/null
 else
-  /usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json >/dev/null
-  systemctl restart xray
+  timeout 20 /usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json >/dev/null
+  timeout 25 systemctl restart xray
 fi" || true
   fi
 
   if [[ "$REMOTE_TR_ADDED" -eq 1 && -n "$TR_HOST" ]]; then
-    ssh -i "${SSH_KEY}" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 "root@${TR_HOST}" "UUID='${TR_UUID}' NAME='${NAME}' python3 - <<'PY'
+    remote_exec "${TR_HOST}" "UUID='${TR_UUID}' NAME='${NAME}' python3 - <<'PY'
 import os, json
 p='/usr/local/etc/xray/config.json'
 cfg=json.load(open(p,'r',encoding='utf-8'))
@@ -218,11 +229,11 @@ open(p,'a',encoding='utf-8').write('\\n')
 os.chmod(p, 0o644)
 PY
 if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx hexenvpn-xray; then
-  docker exec hexenvpn-xray xray run -test -config /usr/local/etc/xray/config.json >/dev/null
-  docker restart hexenvpn-xray >/dev/null
+  timeout 20 docker exec hexenvpn-xray xray run -test -config /usr/local/etc/xray/config.json >/dev/null
+  timeout 25 docker restart hexenvpn-xray >/dev/null
 else
-  /usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json >/dev/null
-  systemctl restart xray
+  timeout 20 /usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json >/dev/null
+  timeout 25 systemctl restart xray
 fi" || true
   fi
 
@@ -241,7 +252,7 @@ fi
 remote_has_uuid() {
   local host="$1"
   local uuid="$2"
-  ssh -i "${SSH_KEY}" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 "root@${host}" "UUID='${uuid}' python3 - <<'PY'
+  remote_exec "${host}" "UUID='${uuid}' python3 - <<'PY'
 import os, json
 uuid=os.environ['UUID']
 cfg=json.load(open('/usr/local/etc/xray/config.json','r',encoding='utf-8'))
@@ -261,7 +272,7 @@ add_uuid_remote() {
   local uuid="$2"
   local name="$3"
 
-  ssh -i "${SSH_KEY}" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 "root@${host}" "UUID='${uuid}' NAME='${name}' python3 - <<'PY'
+  remote_exec "${host}" "UUID='${uuid}' NAME='${name}' python3 - <<'PY'
 import os, json
 p='/usr/local/etc/xray/config.json'
 with open(p,'r',encoding='utf-8') as f:
@@ -289,11 +300,11 @@ os.chmod(p, 0o644)
 print('OK', uuid)
 PY
 if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx hexenvpn-xray; then
-  docker exec hexenvpn-xray xray run -test -config /usr/local/etc/xray/config.json >/dev/null
-  docker restart hexenvpn-xray >/dev/null
+  timeout 20 docker exec hexenvpn-xray xray run -test -config /usr/local/etc/xray/config.json >/dev/null
+  timeout 25 docker restart hexenvpn-xray >/dev/null
 else
-  /usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json >/dev/null
-  systemctl restart xray
+  timeout 20 /usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json >/dev/null
+  timeout 25 systemctl restart xray
 fi"
 }
 
