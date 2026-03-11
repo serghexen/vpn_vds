@@ -67,12 +67,14 @@ ChallengeResponseAuthentication no
 PubkeyAuthentication yes
 PermitRootLogin prohibit-password
 MaxAuthTries 3
-LoginGraceTime 30
 X11Forwarding no
 AllowAgentForwarding no
 AllowTcpForwarding yes
-ClientAliveInterval 300
-ClientAliveCountMax 2
+ClientAliveInterval 30
+ClientAliveCountMax 10
+MaxStartups 50:30:200
+MaxSessions 50
+LoginGraceTime 60
 EOF
 
   sshd -t

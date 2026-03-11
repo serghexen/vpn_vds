@@ -5,6 +5,11 @@
 
 Что настраивает:
 1. SSH hardening через drop-in: `/etc/ssh/sshd_config.d/90-hexenvpn-hardening.conf`
+   - `ClientAliveInterval 30`
+   - `ClientAliveCountMax 10`
+   - `MaxStartups 50:30:200`
+   - `MaxSessions 50`
+   - `LoginGraceTime 60`
 2. UFW:
    - `deny incoming`
    - `allow outgoing`
