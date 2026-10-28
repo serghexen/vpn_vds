@@ -1,0 +1,23 @@
+services:
+  hysteria:
+    image: ${HYSTERIA_IMAGE:?Set a verified image digest}
+    container_name: hexenvpn-hysteria-plain-test
+    command: ["server", "-c", "/etc/hysteria/server.json", "--disable-update-check"]
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 192m
+    cpus: "0.50"
+    pids_limit: 64
+    ports:
+      - "${HYSTERIA_BIND_IP:?Set public IPv4}:2443:2443/udp"
+    volumes:
+      - ./hysteria/server-plain.json:/etc/hysteria/server.json:ro
+      - /etc/letsencrypt/live/${HYSTERIA_DOMAIN:?Set certificate domain}:/etc/letsencrypt/live/${HYSTERIA_DOMAIN}:ro
+      - /etc/letsencrypt/archive/${HYSTERIA_DOMAIN}:/etc/letsencrypt/archive/${HYSTERIA_DOMAIN}:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"

@@ -1,0 +1,27 @@
+services:
+  mtproxy:
+    image: telegrammessenger/proxy@sha256:73210d43c8f8e4c888ba4e30d6daf7742528e9134252a1cd538caabf5e24a597
+    container_name: hexenvpn-mtproxy
+    restart: unless-stopped
+    entrypoint: ["/bin/bash", "/opt/start.sh"]
+    environment:
+      PUBLIC_IP: ${PUBLIC_IP:?Set PUBLIC_IP}
+    ports:
+      - "0.0.0.0:9443:9443/tcp"
+    volumes:
+      - ./start.sh:/opt/start.sh:ro
+      - ./data:/data:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: [ALL]
+    cap_add: [SETUID, SETGID]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 192m
+    cpus: 0.50
+    pids_limit: 64
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"

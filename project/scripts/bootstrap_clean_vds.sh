@@ -192,14 +192,18 @@ obj = json.loads(src.read_text(encoding='utf-8'))
 for ib in obj.get('inbounds', []):
     if ib.get('protocol') != 'vless':
         continue
-    ib.setdefault('settings', {})['clients'] = [{
+    client = {
         'id': os.environ['UUID'],
-        'flow': 'xtls-rprx-vision',
         'email': os.environ['INITIAL_EMAIL'],
-    }]
-    rs = ib.get('streamSettings', {}).get('realitySettings', {})
-    rs['privateKey'] = os.environ['REALITY_PRIVATE_KEY']
-    rs['shortIds'] = [os.environ['SHORT_ID']]
+    }
+    stream = ib.get('streamSettings', {})
+    if stream.get('network') == 'tcp' and stream.get('security') == 'reality':
+        client['flow'] = 'xtls-rprx-vision'
+    ib.setdefault('settings', {})['clients'] = [client]
+    rs = stream.get('realitySettings')
+    if rs is not None:
+        rs['privateKey'] = os.environ['REALITY_PRIVATE_KEY']
+        rs['shortIds'] = [os.environ['SHORT_ID']]
 
 out.write_text(json.dumps(obj, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
 PY

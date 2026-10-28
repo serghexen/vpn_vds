@@ -13,6 +13,7 @@ Options:
   --check-user <name>          Extra healthcheck user validation
   --skip-precheck              Skip pre-release healthcheck
   --skip-postcheck             Skip post-release healthcheck
+  --skip-ru-tr-bridge-check    Skip RU->TR bridge healthcheck
   --pull-xray                  Pull latest xray image before restart
   --build-bot                  Rebuild bot image before restart
   --help                       Show this help
@@ -49,6 +50,7 @@ BACKUP_ROOT="/root/backup-release-master"
 CHECK_USER=""
 SKIP_PRECHECK=0
 SKIP_POSTCHECK=0
+SKIP_RU_TR_BRIDGE_CHECK=0
 PULL_XRAY=0
 BUILD_BOT=0
 
@@ -66,6 +68,8 @@ while [[ $# -gt 0 ]]; do
       SKIP_PRECHECK=1; shift ;;
     --skip-postcheck)
       SKIP_POSTCHECK=1; shift ;;
+    --skip-ru-tr-bridge-check)
+      SKIP_RU_TR_BRIDGE_CHECK=1; shift ;;
     --pull-xray)
       PULL_XRAY=1; shift ;;
     --build-bot)
@@ -101,6 +105,11 @@ fi
 HEALTHCHECK_SCRIPT="$REPO_DIR/project/scripts/healthcheck_master_replicas.sh"
 if [[ ! -f "$HEALTHCHECK_SCRIPT" ]]; then
   echo "Missing healthcheck script: $HEALTHCHECK_SCRIPT" >&2
+  exit 1
+fi
+RU_TR_BRIDGE_HEALTHCHECK_SCRIPT="$REPO_DIR/project/scripts/healthcheck_ru_tr_bridge.sh"
+if [[ ! -f "$RU_TR_BRIDGE_HEALTHCHECK_SCRIPT" ]]; then
+  echo "Missing healthcheck script: $RU_TR_BRIDGE_HEALTHCHECK_SCRIPT" >&2
   exit 1
 fi
 
@@ -141,6 +150,15 @@ run_healthcheck() {
     "$HEALTHCHECK_SCRIPT" --user "$CHECK_USER"
   else
     "$HEALTHCHECK_SCRIPT"
+  fi
+  if [[ "$SKIP_RU_TR_BRIDGE_CHECK" == "0" ]]; then
+    if [[ -n "$CHECK_USER" ]]; then
+      "$RU_TR_BRIDGE_HEALTHCHECK_SCRIPT" --user "$CHECK_USER"
+    else
+      "$RU_TR_BRIDGE_HEALTHCHECK_SCRIPT"
+    fi
+  else
+    echo "[release] $mode RU->TR bridge healthcheck skipped"
   fi
   echo "[release] $mode healthcheck: OK"
 }

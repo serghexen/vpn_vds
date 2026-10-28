@@ -3,6 +3,11 @@ set -Eeuo pipefail
 
 UK_HOST="${UK_HOST:-}"
 TR_HOST="${TR_HOST:-}"
+TR_LINK_HOST="${TR_LINK_HOST:-}"
+TR_LINK_SYNC_HOST=""
+if [[ -n "$TR_LINK_HOST" && "$TR_LINK_HOST" != "$TR_HOST" ]]; then
+  TR_LINK_SYNC_HOST="$TR_LINK_HOST"
+fi
 SSH_KEY="${SSH_KEY:-/root/.ssh/vless_sync_ed25519}"
 SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-10}"
 SSH_SERVER_ALIVE_INTERVAL="${SSH_SERVER_ALIVE_INTERVAL:-10}"
@@ -86,6 +91,7 @@ SUCCESS=0
 MASTER_CHANGED=0
 REMOTE_UK_CHANGED=0
 REMOTE_TR_CHANGED=0
+REMOTE_RU_CHANGED=0
 U_NAME=""
 U_UUID=""
 U_TOKEN=""
@@ -159,14 +165,21 @@ p='/usr/local/etc/xray/config.json'
 cfg=json.load(open(p,'r',encoding='utf-8'))
 uuid=os.environ['UUID']
 name=os.environ['NAME']
+found=False
 for ib in cfg.get('inbounds',[]):
     if ib.get('protocol')!='vless':
         continue
+    found=True
     clients=ib.setdefault('settings',{}).setdefault('clients',[])
     if any(c.get('id')==uuid for c in clients):
-        break
-    clients.append({'id':uuid,'flow':'xtls-rprx-vision','email':name})
-    break
+        continue
+    client={'id':uuid,'email':name}
+    stream=ib.get('streamSettings',{})
+    if stream.get('network')=='tcp' and stream.get('security')=='reality':
+        client['flow']='xtls-rprx-vision'
+    clients.append(client)
+if not found:
+    raise SystemExit('no vless inbound found')
 json.dump(cfg,open(p,'w',encoding='utf-8'),ensure_ascii=False,indent=2)
 open(p,'a',encoding='utf-8').write('\\n')
 os.chmod(p, 0o644)
@@ -207,6 +220,9 @@ cleanup_on_error() {
   if [[ "$REMOTE_TR_CHANGED" -eq 1 && -n "$TR_HOST" ]]; then
     add_remote_uuid "$TR_HOST" "$TR_UUID" "$U_NAME" || true
   fi
+  if [[ "$REMOTE_RU_CHANGED" -eq 1 && -n "$TR_LINK_SYNC_HOST" ]]; then
+    add_remote_uuid "$TR_LINK_SYNC_HOST" "$TR_UUID" "$U_NAME" || true
+  fi
 
   echo "Rollback complete." >&2
   exit "$rc"
@@ -224,7 +240,7 @@ cp "$CLIENTS_JSON" "$BKP_CLIENTS"
 cp "$XRAY_CFG" "$BKP_CFG"
 
 # Extract target user info + backup uuids from current subscription links
-export NAME UK_HOST TR_HOST
+export NAME UK_HOST TR_HOST TR_LINK_HOST
 INFO_JSON="$(python3 - <<'PY'
 import os, json, base64, re, sys
 from pathlib import Path
@@ -232,6 +248,7 @@ from pathlib import Path
 name = os.environ['NAME']
 uk_host = os.environ.get('UK_HOST', '').strip()
 tr_host = os.environ.get('TR_HOST', '').strip()
+tr_link_host = os.environ.get('TR_LINK_HOST', '').strip() or tr_host
 clients = json.load(open('/var/lib/vless-sub/clients.json','r',encoding='utf-8'))
 row = next((x for x in clients if x.get('name') == name), None)
 if not row:
@@ -251,7 +268,7 @@ if sub_file.exists():
             uid, host = m.group(1), m.group(2)
             if uk_host and host == uk_host:
                 uk = uid
-            elif tr_host and host == tr_host:
+            elif tr_link_host and host == tr_link_host:
                 tr = uid
     except Exception:
         pass
@@ -336,6 +353,10 @@ if [[ -n "$TR_HOST" && -n "$TR_UUID" ]]; then
   tr_res="$(remove_remote_uuid "$TR_HOST" "$TR_UUID")"
   [[ "$tr_res" == REMOVED* ]] && REMOTE_TR_CHANGED=1
 fi
+if [[ -n "$TR_LINK_SYNC_HOST" && -n "$TR_UUID" ]]; then
+  ru_res="$(remove_remote_uuid "$TR_LINK_SYNC_HOST" "$TR_UUID")"
+  [[ "$ru_res" == REMOVED* ]] && REMOTE_RU_CHANGED=1
+fi
 
 if command -v /usr/local/sbin/happ-refresh-links >/dev/null 2>&1; then
   /usr/local/sbin/happ-refresh-links >/dev/null 2>&1 || echo "WARN: happ links refresh failed" >&2
@@ -355,6 +376,9 @@ if [[ -n "$UK_HOST" && -n "$UK_UUID" ]]; then
 fi
 if [[ -n "$TR_HOST" && -n "$TR_UUID" ]]; then
   [[ "$(remote_has_uuid "$TR_HOST" "$TR_UUID")" == "NO" ]] && echo "POSTCHECK tr_node_removed OK"
+fi
+if [[ -n "$TR_LINK_SYNC_HOST" && -n "$TR_UUID" ]]; then
+  [[ "$(remote_has_uuid "$TR_LINK_SYNC_HOST" "$TR_UUID")" == "NO" ]] && echo "POSTCHECK ru_link_node_removed OK"
 fi
 
 echo "REMOVED USER: $U_NAME"

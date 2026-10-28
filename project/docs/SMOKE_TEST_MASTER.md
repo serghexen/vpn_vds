@@ -7,7 +7,8 @@
 1. Контейнеры `hexenvpn-xray` и `hexenvpn-bot` в статусе `Up`.
 2. Порт `443` слушается на мастере.
 3. `healthcheck_master_replicas.sh` проходит успешно.
-4. (Опционально) HTTP:
+4. `healthcheck_ru_tr_bridge.sh` проходит успешно (или `SKIP`, если bridge-режим не включен).
+5. (Опционально) HTTP:
    - `GET <BASE_URL>/sub/<user>` -> `200`
    - `GET <BASE_URL>/i/<user>` -> `200`
 
@@ -25,6 +26,11 @@ bash project/scripts/smoke_test_master.sh --check-user test1
 ## Если на сервере самоподписанный сертификат
 ```bash
 bash project/scripts/smoke_test_master.sh --check-user test1 --insecure
+```
+
+## Если нужно пропустить проверку RU->TR bridge
+```bash
+bash project/scripts/smoke_test_master.sh --skip-ru-tr-bridge-check
 ```
 
 Примечания:

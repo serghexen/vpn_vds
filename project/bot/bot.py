@@ -87,10 +87,16 @@ TRAFFIC_ANOMALY_RATIO = float(os.environ.get("TRAFFIC_ANOMALY_RATIO", "2.5"))
 TRAFFIC_ANOMALY_MIN_TOTAL_MB = int(os.environ.get("TRAFFIC_ANOMALY_MIN_TOTAL_MB", "500"))
 CONN_SPIKE_DELTA = int(os.environ.get("CONN_SPIKE_DELTA", "5"))
 CONN_SPIKE_MIN_ONLINE = int(os.environ.get("CONN_SPIKE_MIN_ONLINE", "8"))
+TG_API_TIMEOUT_SEC = int(os.environ.get("TG_API_TIMEOUT_SEC", "12"))
+TG_API_RETRIES = int(os.environ.get("TG_API_RETRIES", "2"))
+TG_API_RETRY_BACKOFF_SEC = float(os.environ.get("TG_API_RETRY_BACKOFF_SEC", "0.7"))
+TG_GETUPDATES_EXTRA_TIMEOUT_SEC = int(os.environ.get("TG_GETUPDATES_EXTRA_TIMEOUT_SEC", "8"))
+TG_GETUPDATES_RETRIES = int(os.environ.get("TG_GETUPDATES_RETRIES", "0"))
 SSH_KEY_DEFAULT = "/root/.ssh/vless_sync_ed25519"
 SSH_KEY = os.environ.get("SSH_KEY", SSH_KEY_DEFAULT).strip() or SSH_KEY_DEFAULT
 UK_HOST = os.environ.get("UK_HOST", "").strip()
 TR_HOST = os.environ.get("TR_HOST", "").strip()
+TR_LINK_HOST = (os.environ.get("TR_LINK_HOST", "").strip() or TR_HOST)
 ADMIN_TG_IDS = parse_int_set(os.environ.get("ADMIN_TG_IDS", ""))
 ADMIN_TG_USERNAMES = parse_str_set(os.environ.get("ADMIN_TG_USERNAMES", ""))
 PRIMARY_ADMIN_TG_ID = int(os.environ.get("PRIMARY_ADMIN_TG_ID", "227380225"))
@@ -190,11 +196,27 @@ def api_call(method: str, payload: dict):
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=35) as resp:
-        obj = json.loads(resp.read().decode("utf-8", errors="ignore"))
-    if not obj.get("ok"):
-        raise RuntimeError(f"Telegram API {method} failed: {obj}")
-    return obj.get("result")
+    if method == "getUpdates":
+        req_timeout = max(TG_API_TIMEOUT_SEC, int(payload.get("timeout", 30)) + TG_GETUPDATES_EXTRA_TIMEOUT_SEC)
+        retries = max(0, TG_GETUPDATES_RETRIES)
+    else:
+        req_timeout = max(3, TG_API_TIMEOUT_SEC)
+        retries = max(0, TG_API_RETRIES)
+
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=req_timeout) as resp:
+                obj = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            if not obj.get("ok"):
+                raise RuntimeError(f"Telegram API {method} failed: {obj}")
+            return obj.get("result")
+        except Exception as e:
+            last_err = e
+            if attempt >= retries:
+                break
+            time.sleep(TG_API_RETRY_BACKOFF_SEC * (2 ** attempt))
+    raise RuntimeError(f"Telegram API {method} failed after retries: {last_err}")
 
 
 def init_db(conn: sqlite3.Connection):
@@ -481,10 +503,25 @@ def _statsquery_local():
         + shlex.quote("docker exec hexenvpn-xray /usr/local/bin/xray api statsquery --server=127.0.0.1:10085")
     )
     rc, out = run_cmd(["sh", "-lc", cmd], timeout_sec=LIVE_ONLINE_TIMEOUT_SEC)
+    if rc == 0 and _statsquery_output_failed(out):
+        return 1, out
     return rc, out
 
 
+def _statsquery_output_failed(raw: str):
+    s = (raw or "").lower()
+    return ("failed to dial" in s) or ("connection refused" in s) or ("no such host" in s)
+
+
 def _statsquery_remote(host: str):
+    remote_cmd = (
+        "if command -v docker >/dev/null 2>&1 && "
+        "docker ps --format '{{.Names}}' 2>/dev/null | grep -qx hexenvpn-xray; then "
+        "docker exec hexenvpn-xray /usr/local/bin/xray api statsquery --server=127.0.0.1:10085; "
+        "else "
+        "/usr/local/bin/xray api statsquery --server=127.0.0.1:10085; "
+        "fi"
+    )
     args = [
         "ssh",
         "-i",
@@ -496,9 +533,12 @@ def _statsquery_remote(host: str):
         "-o",
         "ConnectTimeout=8",
         f"root@{host}",
-        "/usr/local/bin/xray api statsquery --server=127.0.0.1:10085",
+        remote_cmd,
     ]
-    return run_cmd(args, timeout_sec=LIVE_ONLINE_TIMEOUT_SEC)
+    rc, out = run_cmd(args, timeout_sec=LIVE_ONLINE_TIMEOUT_SEC)
+    if rc == 0 and _statsquery_output_failed(out):
+        return 1, out
+    return rc, out
 
 
 def _collect_traffic_node(kind: str, host: str):
@@ -2026,7 +2066,7 @@ def _extract_replica_uuids(vpn_name: str):
         host = m.group(2).strip()
         if UK_HOST and host == UK_HOST:
             out["uk"] = uid
-        if TR_HOST and host == TR_HOST:
+        if TR_LINK_HOST and host == TR_LINK_HOST:
             out["tr"] = uid
     return out
 
@@ -2092,7 +2132,12 @@ def sync_block_state_on_replicas(vpn_name: str, blocked: bool):
     if UK_HOST:
         nodes.append(("UK", UK_HOST, uuids.get("uk", "")))
     if TR_HOST:
-        nodes.append(("TR", TR_HOST, uuids.get("tr", "")))
+        # Bridge mode: TR profile points to TR_LINK_HOST (for example RU entry node),
+        # so block/unblock must be synced on entry node, not on downstream TR host.
+        if TR_LINK_HOST and TR_LINK_HOST != TR_HOST:
+            nodes.append(("TR-LINK", TR_LINK_HOST, uuids.get("tr", "")))
+        else:
+            nodes.append(("TR", TR_HOST, uuids.get("tr", "")))
     for label, host, uid in nodes:
         if not uid:
             errs.append(f"{label}: не найден UUID в подписке пользователя")
@@ -2320,13 +2365,16 @@ def kb_admin_service():
             ],
             [{"text": "📊 Трафик (24ч)", "callback_data": CB_ADMIN_TRAFFIC}],
             [{"text": "📈 Трафик узлов", "callback_data": CB_ADMIN_NODE_TRAFFIC}],
-            [
-                {"text": "🔍 Диаг UK", "callback_data": CB_ADMIN_DIAG_UK},
-                {"text": "🔍 Диаг TR", "callback_data": CB_ADMIN_DIAG_TR},
-            ],
-            [
-                {"text": "🔁 Рестарт UK", "callback_data": CB_ADMIN_RESTART_UK},
-                {"text": "🔁 Рестарт TR", "callback_data": CB_ADMIN_RESTART_TR},
+            *[
+                [
+                    {"text": f"🔍 Диаг {label}", "callback_data": diag},
+                    {"text": f"🔁 Рестарт {label}", "callback_data": restart},
+                ]
+                for label, host, diag, restart in (
+                    ("UK", UK_HOST, CB_ADMIN_DIAG_UK, CB_ADMIN_RESTART_UK),
+                    ("TR", TR_HOST, CB_ADMIN_DIAG_TR, CB_ADMIN_RESTART_TR),
+                )
+                if host
             ],
             [{"text": "🔄 Обновить", "callback_data": CB_ADMIN_DEVICES_REFRESH}],
             [{"text": "⬅️ Вернуться назад", "callback_data": CB_ADMIN}],
@@ -3152,6 +3200,17 @@ def dispatch_action(conn: sqlite3.Connection, msg: dict, action: str):
     chat_id = msg["chat"]["id"]
     user = msg["from"]
     tg_id = int(user["id"])
+
+    # Old Telegram messages can retain buttons for a retired node.
+    for host, actions in (
+        (UK_HOST, (CB_ADMIN_DIAG_UK, CB_ADMIN_RESTART_UK, CB_CONFIRM_RESTART_UK)),
+        (TR_HOST, (CB_ADMIN_DIAG_TR, CB_ADMIN_RESTART_TR, CB_CONFIRM_RESTART_TR)),
+    ):
+        if not host and action in actions:
+            if is_admin_user(user):
+                clear_admin_state(conn, tg_id)
+                send_message(chat_id, "Узел отключён. Обнови меню администратора.", kb_admin_service())
+            return
 
     st = get_admin_state(conn, tg_id)
     if st and st.get("step") == STATE_SELECT_USER and action.startswith((CB_SEL_USER_PREFIX, CB_SEL_PREV, CB_SEL_NEXT, CB_SEL_FIND)):

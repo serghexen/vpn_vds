@@ -1,0 +1,24 @@
+services:
+  trojan:
+    image: ${XRAY_IMAGE:?Set a verified local image digest}
+    container_name: hexenvpn-trojan-test
+    command: ["run", "-config", "/etc/xray/config.json"]
+    user: "0:0"
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 192m
+    cpus: "0.50"
+    pids_limit: 64
+    ports:
+      - "0.0.0.0:${TROJAN_PORT:?Set test port}:2087/tcp"
+    volumes:
+      - ./config.json:/etc/xray/config.json:ro
+      - /etc/letsencrypt/live/${TLS_DOMAIN:?Set TLS domain}:/etc/letsencrypt/live/${TLS_DOMAIN}:ro
+      - /etc/letsencrypt/archive/${TLS_DOMAIN}:/etc/letsencrypt/archive/${TLS_DOMAIN}:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"

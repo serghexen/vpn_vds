@@ -1,5 +1,38 @@
 # Базовая конфигурация VPN-проекта (с мастера)
 
+## Действующая инфраструктура: 26.10.2026
+
+- Мастер США: `82.21.92.91`, домены `serghexen.ru` и `23pr.serghexen.ru`.
+  Предыдущий адрес `82.39.214.176` больше не используется.
+- TR `193.46.56.199` выведена из эксплуатации. UK также отключена.
+  Упоминания TR, RU -> TR и старых адресов ниже и в прежних runbook описывают
+  доступные шаблоны или историю, а не действующие узлы.
+- В runtime `nodes.env`: `TR_HOST`, `TR_LINK_HOST`, `TR_PBK`, `TR_LINK_PBK`,
+  `TR_WS_HOST`, `TR_WS_SNI` пусты; `TR_WS_ENABLED=0`.
+  При отсутствии реплик `REPLICA_MONITOR_ENABLED=0`; монитор мастера включен.
+- TR-профили удалены из обеих копий подписок всех 19 пользователей
+  (имя и токен). Тест USA via TR снят с выдачи. Пользователи, UUID, сроки,
+  исторические записи трафика и резервные копии сохранены.
+- Админка показывает диагностику/рестарт только включенных реплик;
+  кнопки отключенных узлов в старых сообщениях больше не запускают команды.
+- Hysteria UDP 443/2443 и MTProxy 9443 переведены на новый адрес.
+  HTTP CONNECT для внешнего notifier: `http://82.21.92.91:3128`.
+  Сам notifier не изменялся; его переменную меняет владелец другого проекта.
+- Отдельный личный тест VLESS + XHTTP + TLS на `2096/TCP`: контейнер
+  `hexenvpn-xhttp-test`, инструкции в `project/xhttp-test/README.md`.
+  В общую подписку не включен; AmneziaWG не устанавливалась.
+- Отдельный личный тест Trojan + TLS на `2087/TCP`: контейнер
+  `hexenvpn-trojan-test`, инструкции в `project/trojan-test/README.md`.
+  В общую подписку не включен; сроками и блокировками бота не управляется.
+- A-запись `tr.serghexen.ru` следует удалить в панели DNS. Старые клиентские
+  подписки нужно обновить, чтобы убрать Турцию из приложения.
+
+Бэкапы на мастере: `/root/backup-ip-change-20261026T141352Z` и
+`/root/backup-retire-tr-20261026T142236Z`. По решению владельца новые копии
+оставлены только на сервере; на локальный компьютер они не переносились.
+Основной Xray, SSH и firewall при этой операции не менялись; пересоздавался
+бот для применения env, а также отдельные Hysteria/MTProxy контейнеры.
+
 В проекте хранится воспроизводимая базовая конфигурация:
 - сервис Xray и его конфиг
 - сервис Telegram-бота и код бота
@@ -43,6 +76,7 @@
 2. Заполните секреты/конфиги:
    - `project/env/bot.env`
    - `project/env/nodes.env` (`MASTER_HOST`, `MASTER_PBK`, опционально `UK_*`/`TR_*`)
+   - для bridge-схемы `RU -> TR`: задайте `TR_LINK_HOST=<RU_IP>` и `TR_LINK_PBK=<RU_REALITY_PUBLIC_KEY>`
    - `project/runtime/xray/config.json`
    - (опционально) SSH-ключ для синхронизации реплик: `project/env/ssh/vless_sync_ed25519`
 3. Запустите:
@@ -80,6 +114,8 @@ Bootstrap-скрипт:
 ## Операционный healthcheck и инциденты
 - Скрипт быстрой проверки master+replicas:
   - `project/scripts/healthcheck_master_replicas.sh`
+- Проверка bridge-цепочки `RU -> TR` (если включен `TR_LINK_HOST`):
+  - `project/scripts/healthcheck_ru_tr_bridge.sh`
 - Отдельная проверка конкретной реплики:
   - `project/scripts/healthcheck_replica.sh --node uk`
   - `project/scripts/healthcheck_replica.sh --node tr`
@@ -115,6 +151,28 @@ Bootstrap-скрипт:
   - включается переменными `MONITOR_*` в `project/env/bot.env`
   - отправляет алерты администраторам (`PRIMARY_ADMIN_TG_ID` + `ADMIN_TG_IDS`) при проблемах healthcheck
 
+## Резервный master-профиль WS+TLS
+
+На мастере параллельно с `VLESS TCP REALITY :443` может работать профиль `VLESS WebSocket TLS :2053`:
+
+- nginx принимает TLS на `2053` и проксирует `/api/v1/stream` на `127.0.0.1:10086`;
+- Xray слушает WS-вход только через локальный Docker port mapping;
+- `vless-add-user`, `vless-del-user` и `vless-sync-expire` синхронизируют оба master-inbound;
+- `refresh_master_ws_alt.py` добавляет ALT-ссылку существующим пользователям;
+- end-to-end проверка: `project/scripts/smoke_test_master_ws_alt.sh <vpn_name>`.
+
+Переменные находятся в `project/env/nodes.env.example` (`MASTER_WS_*`).
+
+## Резервный TR-профиль WS+TLS
+
+TR может одновременно обслуживать старый `VLESS TCP REALITY :443` и резервный `VLESS WebSocket TLS :2053`.
+
+- переменные: `project/env/nodes.env.example` (`TR_WS_*`);
+- обновление существующих подписок: `project/scripts/refresh_tr_ws_alt.py`;
+- nginx-шаблон: `project/nginx/replica-ws.conf.template`;
+- Xray inbound-шаблон: `project/xray/replica-ws-inbound.template.json`;
+- инструкция и откат: `project/docs/REPLICA_WS_TLS.md`.
+
 ## Автозапуск после reboot (обязательно)
 Чтобы после перезагрузки VDS сервисы поднимались автоматически:
 
@@ -130,7 +188,7 @@ Bootstrap-скрипт:
 
 ## SSH доступ к мастеру
 - Подключение по ключу:
-  - `ssh -i ~/.ssh/id_rsa -o IdentitiesOnly=yes adminops@86.104.72.155`
+  - `ssh -i ~/.ssh/id_rsa -o IdentitiesOnly=yes adminops@serghexen.ru`
 - Быстрая проверка:
   - `hostname && whoami`
 - Примечание:

@@ -49,6 +49,67 @@ function findClientByKey(key) {
     return null;
 }
 
+function readSubBodyByKey(key) {
+    try {
+        return fs.readFileSync("/var/www/sub/" + key).toString().trim();
+    } catch (e1) {
+        var found = findClientByKey(key);
+        if (found && found.token) {
+            try {
+                return fs.readFileSync("/var/www/sub/" + found.token).toString().trim();
+            } catch (e2) {
+                return "";
+            }
+        }
+        return "";
+    }
+}
+
+function isLikelyBase64(s) {
+    if (!s || s.length < 16) {
+        return false;
+    }
+    return /^[A-Za-z0-9+/=\r\n]+$/.test(s);
+}
+
+function decodeBase64ToUtf8(s) {
+    try {
+        return Buffer.from(s, "base64").toString("utf-8");
+    } catch (e) {
+        return "";
+    }
+}
+
+function looksLikeLinkList(s) {
+    return !!(s && (s.indexOf("vless://") >= 0 || s.indexOf("vmess://") >= 0 || s.indexOf("trojan://") >= 0));
+}
+
+function sub_response(r) {
+    var key = tokenFromURI(r.uri);
+    if (!key) {
+        r.return(404, "Not found");
+        return;
+    }
+
+    var body = readSubBodyByKey(key);
+    if (!body) {
+        r.return(404, "Not found");
+        return;
+    }
+
+    var ua = ((r.headersIn["User-Agent"] || r.headersIn["user-agent"] || "") + "").toLowerCase();
+    var isV2RayTun = ua.indexOf("v2raytun") >= 0 || ua.indexOf("v2ray") >= 0;
+    if (isV2RayTun && isLikelyBase64(body)) {
+        var decoded = decodeBase64ToUtf8(body);
+        if (looksLikeLinkList(decoded)) {
+            body = decoded;
+        }
+    }
+
+    r.headersOut["Content-Type"] = "text/plain; charset=utf-8";
+    r.return(200, body);
+}
+
 function loadHappLinks() {
     var now = Date.now();
     if (happCache.data && (now - happCache.ts) < CACHE_MS) {
@@ -77,20 +138,8 @@ function add_headers(r) {
         expire = Number(found.expire) || 0;
     }
 
-    var ua = ((r.headersIn["User-Agent"] || r.headersIn["user-agent"] || "") + "").toLowerCase();
-    var isHapp = ua.indexOf("happ") >= 0;
-    var isV2RayTun = ua.indexOf("v2raytun") >= 0 || ua.indexOf("v2ray") >= 0;
-    var announceText = "⚠️ Если не работает, обнови подписку 🔄 • по вопросам пиши @serg_hexen";
-    if (isHapp) {
-        announceText = "⚠️ Если не работает, обнови подписку 🔄 • по вопросам пиши @serg_hexen";
-    } else if (isV2RayTun) {
-        announceText = "⚠️ Если не работает, обнови подписку 🔄 • по вопросам пиши @serg_hexen";
-    }
-
     r.headersOut["Profile-Update-Interval"] = "24";
     r.headersOut["Profile-Title"] = "HexenKVN";
-    r.headersOut["announce"] = announceText;
-    r.headersOut["announce-url"] = "https://t.me/serg_hexen";
     r.headersOut["Support-Url"] = "https://serghexen.ru:8443/support";
     r.headersOut["Profile-Web-Page-Url"] = "https://serghexen.ru:8443/support";
 
@@ -322,4 +371,4 @@ function import_redirect(r) {
     r.return(404, "Unknown platform");
 }
 
-export default { add_headers, import_redirect };
+export default { add_headers, import_redirect, sub_response };

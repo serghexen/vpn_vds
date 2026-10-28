@@ -1,0 +1,4 @@
+server.json
+server-plain.json
+client*.json
+*.secret

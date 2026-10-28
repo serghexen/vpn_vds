@@ -70,6 +70,8 @@ if [[ -f "$NODES_ENV" ]]; then
 fi
 
 SSH_KEY="${SSH_KEY:-$SSH_KEY_DEFAULT}"
+TR_WS_ENABLED="${TR_WS_ENABLED:-0}"
+TR_WS_PORT="${TR_WS_PORT:-2053}"
 
 if [[ -z "$HOST" && -n "$NODE" ]]; then
   case "${NODE,,}" in
@@ -93,7 +95,7 @@ fi
 echo "== Replica $LABEL ($HOST) =="
 
 remote_json="$(
-  ssh -i "$SSH_KEY" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout="$SSH_TIMEOUT" "root@$HOST" \
+  ssh -n -i "$SSH_KEY" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout="$SSH_TIMEOUT" "root@$HOST" \
     "CHECK_USER='$CHECK_USER' python3 - <<'PY'
 import collections
 import json
@@ -111,6 +113,7 @@ out = {
     'dup_ids': 0,
     'dup_emails': 0,
     'clients_total': 0,
+    'inbound_count': 0,
     'check_user': check_user,
     'user_count': -1,
     'error': '',
@@ -127,17 +130,17 @@ except Exception as e:
     print(json.dumps(out, ensure_ascii=False))
     raise SystemExit(0)
 
-clients = []
-for ib in cfg.get('inbounds', []):
-    if ib.get('protocol') != 'vless':
-        continue
-    clients.extend(ib.get('settings', {}).get('clients', []) or [])
-
-ids = [(c.get('id') or '').strip() for c in clients if c.get('id')]
-emails = [(c.get('email') or '').strip().lower() for c in clients if c.get('email')]
-out['dup_ids'] = len([k for k, v in collections.Counter(ids).items() if v > 1])
-out['dup_emails'] = len([k for k, v in collections.Counter(emails).items() if v > 1])
-out['clients_total'] = len(clients)
+inbounds = [ib for ib in cfg.get('inbounds', []) if ib.get('protocol') == 'vless']
+all_ids = set()
+for ib in inbounds:
+    clients = ib.get('settings', {}).get('clients', []) or []
+    ids = [(c.get('id') or '').strip() for c in clients if c.get('id')]
+    emails = [(c.get('email') or '').strip().lower() for c in clients if c.get('email')]
+    out['dup_ids'] += len([k for k, v in collections.Counter(ids).items() if v > 1])
+    out['dup_emails'] += len([k for k, v in collections.Counter(emails).items() if v > 1])
+    all_ids.update(ids)
+out['clients_total'] = len(all_ids)
+out['inbound_count'] = len(inbounds)
 
 docker_active = False
 r = run(['sh', '-lc', 'docker ps --format \\'{{.Names}}\\' 2>/dev/null | grep -qx hexenvpn-xray'])
@@ -162,11 +165,11 @@ r3 = run(['sh', '-lc', 'ss -ltn 2>/dev/null | grep -q :443'])
 out['port_443'] = (r3.returncode == 0)
 
 if check_user:
-    cnt = 0
-    for c in clients:
-        if (c.get('email') or '').strip().lower() == check_user:
-            cnt += 1
-    out['user_count'] = cnt
+    out['user_count'] = sum(
+        1 for ib in inbounds
+        if sum(1 for c in ib.get('settings', {}).get('clients', [])
+               if (c.get('email') or '').strip().lower() == check_user) == 1
+    )
 
 print(json.dumps(out, ensure_ascii=False))
 PY"
@@ -187,6 +190,7 @@ print("1" if obj.get("port_443") else "0")
 print(int(obj.get("dup_ids") or 0))
 print(int(obj.get("dup_emails") or 0))
 print(int(obj.get("clients_total") or 0))
+print(int(obj.get("inbound_count") or 0))
 print(obj.get("check_user") or "")
 print(int(obj.get("user_count") if obj.get("user_count") is not None else -1))
 print(obj.get("error") or "")
@@ -200,9 +204,10 @@ port_443="${parsed[3]:-0}"
 dup_ids="${parsed[4]:-0}"
 dup_emails="${parsed[5]:-0}"
 clients_total="${parsed[6]:-0}"
-user_name="${parsed[7]:-}"
-user_count="${parsed[8]:--1}"
-remote_error="${parsed[9]:-}"
+inbound_count="${parsed[7]:-0}"
+user_name="${parsed[8]:-}"
+user_count="${parsed[9]:--1}"
+remote_error="${parsed[10]:-}"
 
 if [[ "$is_ok" != "1" ]]; then
   fail "replica $LABEL check error: ${remote_error:-unknown}"
@@ -219,17 +224,26 @@ else
     fail "replica $LABEL port 443 not listening"
   fi
 
+  if [[ "${NODE,,}" == "tr" && "$TR_WS_ENABLED" == "1" ]]; then
+    if ssh -n -i "$SSH_KEY" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout="$SSH_TIMEOUT" "root@$HOST" \
+      "ss -ltn 2>/dev/null | grep -q ':${TR_WS_PORT} '"; then
+      ok "replica $LABEL WS TLS port $TR_WS_PORT listening"
+    else
+      fail "replica $LABEL WS TLS port $TR_WS_PORT not listening"
+    fi
+  fi
+
   if [[ "$dup_ids" == "0" && "$dup_emails" == "0" ]]; then
-    ok "replica $LABEL duplicates: none (clients=$clients_total)"
+    ok "replica $LABEL duplicates: none (clients=$clients_total inbounds=$inbound_count)"
   else
     fail "replica $LABEL duplicates found (dup_ids=$dup_ids dup_emails=$dup_emails clients=$clients_total)"
   fi
 
   if [[ -n "$user_name" ]]; then
-    if [[ "$user_count" == "1" ]]; then
-      ok "replica $LABEL user '$user_name' exists exactly once"
+    if [[ "$inbound_count" -gt 0 && "$user_count" == "$inbound_count" ]]; then
+      ok "replica $LABEL user '$user_name' exists once in every inbound ($user_count/$inbound_count)"
     else
-      fail "replica $LABEL user '$user_name' count=$user_count (expected 1)"
+      fail "replica $LABEL user '$user_name' inbound matches=$user_count/$inbound_count"
     fi
   fi
 fi

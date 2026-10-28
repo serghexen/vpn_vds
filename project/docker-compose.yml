@@ -6,6 +6,7 @@ services:
     command: ["run", "-config", "/usr/local/etc/xray/config.json"]
     ports:
       - "443:443/tcp"
+      - "127.0.0.1:10086:10086/tcp"
     volumes:
       - ./runtime/xray:/usr/local/etc/xray
     logging:
@@ -52,6 +53,7 @@ services:
       - ./scripts/vless-sync-expire:/usr/local/sbin/vless-sync-expire:ro
       - ./scripts/healthcheck_master_replicas.sh:/usr/local/sbin/healthcheck-master-replicas:ro
       - ./scripts/healthcheck_replica.sh:/usr/local/sbin/healthcheck-replica:ro
+      - ./scripts/healthcheck_ru_tr_bridge.sh:/usr/local/sbin/healthcheck_ru_tr_bridge:ro
       - ./scripts/replica_ops.sh:/usr/local/sbin/replica-ops:ro
       - ./scripts/metrics_master_light.sh:/usr/local/sbin/metrics-master-light:ro
       - ./runtime/bot:/var/lib/hexenvpn-bot

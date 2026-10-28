@@ -69,13 +69,8 @@ xray_restart_cmd = os.environ.get('XRAY_RESTART_CMD', '')
 clients = json.loads(clients_path.read_text(encoding='utf-8'))
 xray = json.loads(xray_path.read_text(encoding='utf-8'))
 
-vless_ib = None
-for ib in xray.get('inbounds', []):
-    if ib.get('protocol') == 'vless':
-        vless_ib = ib
-        break
-
-if vless_ib is None:
+vless_inbounds = [ib for ib in xray.get('inbounds', []) if ib.get('protocol') == 'vless']
+if not vless_inbounds:
     print('ERROR: no vless inbound in xray config', file=sys.stderr)
     sys.exit(1)
 
@@ -101,21 +96,39 @@ for r in clients:
     if st in ('active', 'grace'):
         active_rows.append(r)
 
-new_clients = []
-for r in active_rows:
-    new_clients.append({
-        'id': r['uuid'],
-        'flow': 'xtls-rprx-vision',
-        'email': r['name'],
+def target_clients_for(inbound):
+    stream = inbound.get('streamSettings', {})
+    use_vision = stream.get('network') == 'tcp' and stream.get('security') == 'reality'
+    result = []
+    for row in active_rows:
+        client = {'id': row['uuid'], 'email': row['name']}
+        if use_vision:
+            client['flow'] = 'xtls-rprx-vision'
+        result.append(client)
+    return result
+
+plans = []
+for index, inbound in enumerate(vless_inbounds, start=1):
+    current = inbound.get('settings', {}).get('clients', [])
+    target = target_clients_for(inbound)
+    current_ids = [c.get('id') for c in current if c.get('id')]
+    target_ids = [c.get('id') for c in target if c.get('id')]
+    plans.append({
+        'inbound': inbound,
+        'target': target,
+        'current_ids': current_ids,
+        'target_ids': target_ids,
+        'changed': current != target,
+        'label': inbound.get('tag') or f'vless-{index}',
     })
 
-cur_clients = vless_ib.get('settings', {}).get('clients', [])
-cur_ids = [c.get('id') for c in cur_clients if c.get('id')]
-new_ids = [c.get('id') for c in new_clients if c.get('id')]
+primary = next((p for p in plans if p['inbound'].get('streamSettings', {}).get('security') == 'reality'), plans[0])
+cur_ids = primary['current_ids']
+new_ids = primary['target_ids']
 
 to_add = sorted(set(new_ids) - set(cur_ids))
 to_remove = sorted(set(cur_ids) - set(new_ids))
-changed = (cur_ids != new_ids)
+changed = any(p['changed'] for p in plans)
 
 print(f'NOW_TS {now_ts}')
 print(f'GRACE_DAYS {grace_days}')
@@ -123,6 +136,8 @@ print(f'STATS active={stats["active"]} grace={stats["grace"]} suspended={stats["
 print(f'XRAY_CURRENT {len(cur_ids)}')
 print(f'XRAY_TARGET {len(new_ids)}')
 print(f'PLAN add={len(to_add)} remove={len(to_remove)} changed={str(changed).lower()}')
+for plan in plans:
+    print(f"INBOUND {plan['label']} current={len(plan['current_ids'])} target={len(plan['target_ids'])} changed={str(plan['changed']).lower()}")
 
 if to_add:
     print('ADD_IDS')
@@ -141,7 +156,9 @@ if not changed:
     print('MODE apply (no changes needed)')
     sys.exit(0)
 
-vless_ib.setdefault('settings', {})['clients'] = new_clients
+for plan in plans:
+    if plan['changed']:
+        plan['inbound'].setdefault('settings', {})['clients'] = plan['target']
 
 tmp_fd, tmp_name = tempfile.mkstemp(prefix='xray-config-', suffix='.json')
 os.close(tmp_fd)

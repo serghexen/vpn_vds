@@ -6,6 +6,7 @@ services:
     command: ["run", "-config", "/usr/local/etc/xray/config.json"]
     ports:
       - "443:443/tcp"
+      - "127.0.0.1:10086:10086/tcp"
     volumes:
       - /usr/local/etc/xray:/usr/local/etc/xray
     logging:
@@ -43,6 +44,10 @@ services:
       REPLICA_OPS_CMD: /usr/local/sbin/replica-ops
     pid: host
     privileged: true
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+      - 1.0.0.1
     volumes:
       - ./bot/bot.py:/opt/hexenvpn-bot/bot.py:ro
       - ./scripts/vless-add-user:/usr/local/sbin/vless-add-user:ro
@@ -50,6 +55,7 @@ services:
       - ./scripts/vless-sync-expire:/usr/local/sbin/vless-sync-expire:ro
       - ./scripts/healthcheck_master_replicas.sh:/usr/local/sbin/healthcheck-master-replicas:ro
       - ./scripts/healthcheck_replica.sh:/usr/local/sbin/healthcheck-replica:ro
+      - ./scripts/healthcheck_ru_tr_bridge.sh:/usr/local/sbin/healthcheck_ru_tr_bridge:ro
       - ./scripts/replica_ops.sh:/usr/local/sbin/replica-ops:ro
       - ./scripts/metrics_master_light.sh:/usr/local/sbin/metrics-master-light:ro
       - /var/lib/hexenvpn-bot:/var/lib/hexenvpn-bot

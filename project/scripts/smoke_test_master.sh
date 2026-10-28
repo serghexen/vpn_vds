@@ -12,6 +12,7 @@ Options:
   --base-url <url>             Base URL for HTTP checks (default: from project/env/bot.env BASE_URL)
   --check-user <name>          User for /sub/<user> and /i/<user> checks
   --skip-healthcheck           Skip healthcheck_master_replicas.sh
+  --skip-ru-tr-bridge-check    Skip healthcheck_ru_tr_bridge.sh
   --insecure                   Use curl -k for HTTPS checks
   --help                       Show help
 
@@ -56,6 +57,7 @@ COMPOSE_FILE="project/docker-compose.master-full.yml"
 BASE_URL=""
 CHECK_USER=""
 SKIP_HEALTHCHECK=0
+SKIP_RU_TR_BRIDGE_CHECK=0
 INSECURE=0
 FAILS=0
 
@@ -71,6 +73,8 @@ while [[ $# -gt 0 ]]; do
       CHECK_USER="${2:-}"; shift 2 ;;
     --skip-healthcheck)
       SKIP_HEALTHCHECK=1; shift ;;
+    --skip-ru-tr-bridge-check)
+      SKIP_RU_TR_BRIDGE_CHECK=1; shift ;;
     --insecure)
       INSECURE=1; shift ;;
     -h|--help)
@@ -152,6 +156,24 @@ if [[ "$SKIP_HEALTHCHECK" == "0" ]]; then
   fi
 else
   warn "healthcheck skipped"
+fi
+
+if [[ "$SKIP_RU_TR_BRIDGE_CHECK" == "0" ]]; then
+  if [[ -n "$CHECK_USER" ]]; then
+    if "$REPO_DIR/project/scripts/healthcheck_ru_tr_bridge.sh" --user "$CHECK_USER" >/dev/null 2>&1; then
+      ok "healthcheck_ru_tr_bridge.sh OK (with user=$CHECK_USER)"
+    else
+      fail "healthcheck_ru_tr_bridge.sh failed (with user=$CHECK_USER)"
+    fi
+  else
+    if "$REPO_DIR/project/scripts/healthcheck_ru_tr_bridge.sh" >/dev/null 2>&1; then
+      ok "healthcheck_ru_tr_bridge.sh OK"
+    else
+      fail "healthcheck_ru_tr_bridge.sh failed"
+    fi
+  fi
+else
+  warn "RU->TR bridge healthcheck skipped"
 fi
 
 if [[ -n "$BASE_URL" && -n "$CHECK_USER" ]]; then

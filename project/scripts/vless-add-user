@@ -10,6 +10,11 @@ MASTER_PBK="${MASTER_PBK:-}"
 MASTER_SID="${MASTER_SID:-ffffffffff}"
 MASTER_FP="${MASTER_FP:-firefox}"
 MASTER_SPX="${MASTER_SPX:-/}"
+MASTER_WS_ENABLED="${MASTER_WS_ENABLED:-0}"
+MASTER_WS_PORT="${MASTER_WS_PORT:-2053}"
+MASTER_WS_SNI="${MASTER_WS_SNI:-$MASTER_HOST}"
+MASTER_WS_PATH="${MASTER_WS_PATH:-/api/v1/stream}"
+MASTER_WS_FP="${MASTER_WS_FP:-chrome}"
 
 UK_HOST="${UK_HOST:-}"
 UK_VLESS_PORT="${UK_VLESS_PORT:-443}"
@@ -20,12 +25,24 @@ UK_FP="${UK_FP:-firefox}"
 UK_SPX="${UK_SPX:-/}"
 
 TR_HOST="${TR_HOST:-}"
+TR_LINK_HOST="${TR_LINK_HOST:-}"
 TR_VLESS_PORT="${TR_VLESS_PORT:-443}"
 TR_SNI="${TR_SNI:-www.yahoo.com}"
 TR_PBK="${TR_PBK:-}"
+TR_LINK_PBK="${TR_LINK_PBK:-}"
 TR_SID="${TR_SID:-ffffffffff}"
 TR_FP="${TR_FP:-firefox}"
 TR_SPX="${TR_SPX:-/}"
+TR_WS_ENABLED="${TR_WS_ENABLED:-0}"
+TR_WS_HOST="${TR_WS_HOST:-$TR_HOST}"
+TR_WS_PORT="${TR_WS_PORT:-2053}"
+TR_WS_SNI="${TR_WS_SNI:-$TR_WS_HOST}"
+TR_WS_PATH="${TR_WS_PATH:-/api/v1/stream}"
+TR_WS_FP="${TR_WS_FP:-chrome}"
+TR_LINK_SYNC_HOST=""
+if [[ -n "$TR_LINK_HOST" && "$TR_LINK_HOST" != "$TR_HOST" ]]; then
+  TR_LINK_SYNC_HOST="$TR_LINK_HOST"
+fi
 
 SSH_KEY="${SSH_KEY:-/root/.ssh/vless_sync_ed25519}"
 SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-10}"
@@ -154,6 +171,16 @@ if [[ -n "$UK_HOST" && -z "$UK_PBK" ]]; then
   exit 1
 fi
 if [[ -n "$TR_HOST" && -z "$TR_PBK" ]]; then
+  if [[ -z "$TR_LINK_PBK" ]]; then
+    echo "TR_HOST is set but TR key for subscription is empty. Fill TR_LINK_PBK (preferred) or TR_PBK." >&2
+    exit 1
+  fi
+fi
+if [[ -n "$TR_HOST" && -n "$TR_LINK_PBK" ]]; then
+  # Bridge mode: TR_LINK_PBK is the public key of TR_LINK_HOST (for example RU entry node).
+  TR_PBK="$TR_LINK_PBK"
+fi
+if [[ -n "$TR_HOST" && -z "$TR_PBK" ]]; then
   echo "TR_HOST is set but TR_PBK is empty. Fill TR_PBK or unset TR_HOST." >&2
   exit 1
 fi
@@ -163,6 +190,7 @@ SUCCESS=0
 MASTER_CHANGED=0
 REMOTE_UK_ADDED=0
 REMOTE_TR_ADDED=0
+REMOTE_RU_ADDED=0
 
 TS="$(date +%F_%H-%M-%S)"
 BKP_DIR="/var/backups/vless"
@@ -237,6 +265,30 @@ else
 fi" || true
   fi
 
+  if [[ "$REMOTE_RU_ADDED" -eq 1 && -n "$TR_LINK_SYNC_HOST" ]]; then
+    remote_exec "${TR_LINK_SYNC_HOST}" "UUID='${TR_UUID}' NAME='${NAME}' python3 - <<'PY'
+import os, json
+p='/usr/local/etc/xray/config.json'
+cfg=json.load(open(p,'r',encoding='utf-8'))
+uuid=os.environ['UUID']; name=os.environ['NAME']
+for ib in cfg.get('inbounds',[]):
+    if ib.get('protocol')!='vless':
+        continue
+    cur=ib.get('settings',{}).get('clients',[])
+    ib.setdefault('settings',{})['clients']=[c for c in cur if c.get('id')!=uuid]
+json.dump(cfg,open(p,'w',encoding='utf-8'),ensure_ascii=False,indent=2)
+open(p,'a',encoding='utf-8').write('\\n')
+os.chmod(p, 0o644)
+PY
+if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx hexenvpn-xray; then
+  timeout 20 docker exec hexenvpn-xray xray run -test -config /usr/local/etc/xray/config.json >/dev/null
+  timeout 25 docker restart hexenvpn-xray >/dev/null
+else
+  timeout 20 /usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json >/dev/null
+  timeout 25 systemctl restart xray
+fi" || true
+  fi
+
   echo "Rollback complete." >&2
   exit "$rc"
 }
@@ -279,19 +331,22 @@ with open(p,'r',encoding='utf-8') as f:
     cfg=json.load(f)
 uuid=os.environ['UUID']
 name=os.environ['NAME']
-added=False
+found=False
 for ib in cfg.get('inbounds',[]):
-    if ib.get('protocol')=='vless':
-        clients=ib.setdefault('settings',{}).setdefault('clients',[])
-        if any(c.get('id')==uuid for c in clients):
-            added=True
-            break
-        if any((c.get('email') or '').strip().lower()==name.lower() for c in clients):
-            raise SystemExit('remote user email already exists: '+name)
-        clients.append({'id': uuid, 'flow': 'xtls-rprx-vision', 'email': name})
-        added=True
-        break
-if not added:
+    if ib.get('protocol')!='vless':
+        continue
+    found=True
+    clients=ib.setdefault('settings',{}).setdefault('clients',[])
+    if any(c.get('id')==uuid for c in clients):
+        continue
+    if any((c.get('email') or '').strip().lower()==name.lower() for c in clients):
+        raise SystemExit('remote user email already exists: '+name)
+    client={'id': uuid, 'email': name}
+    stream=ib.get('streamSettings',{})
+    if stream.get('network')=='tcp' and stream.get('security')=='reality':
+        client['flow']='xtls-rprx-vision'
+    clients.append(client)
+if not found:
     raise SystemExit('no vless inbound found')
 with open(p,'w',encoding='utf-8') as f:
     json.dump(cfg,f,ensure_ascii=False,indent=2)
@@ -351,6 +406,12 @@ if [[ -n "$TR_HOST" && -n "$TR_UUID" ]]; then
     exit 1
   fi
 fi
+if [[ -n "$TR_LINK_SYNC_HOST" && -n "$TR_UUID" ]]; then
+  if [[ "$(remote_has_uuid "$TR_LINK_SYNC_HOST" "$TR_UUID")" == "YES" ]]; then
+    echo "UUID already exists on RU link node: $TR_UUID" >&2
+    exit 1
+  fi
+fi
 
 
 # 1) Ensure backup nodes accept generated UUIDs first
@@ -362,12 +423,18 @@ if [[ -n "$TR_HOST" && -n "$TR_UUID" ]]; then
   add_uuid_remote "$TR_HOST" "$TR_UUID" "$NAME"
   REMOTE_TR_ADDED=1
 fi
+if [[ -n "$TR_LINK_SYNC_HOST" && -n "$TR_UUID" ]]; then
+  add_uuid_remote "$TR_LINK_SYNC_HOST" "$TR_UUID" "$NAME"
+  REMOTE_RU_ADDED=1
+fi
 
 # 2) Update master and create subscription files
 export NAME UK_UUID TR_UUID EXPIRE_TS CLIENTS_JSON XRAY_CFG SUB_DIR
 export MASTER_HOST MASTER_VLESS_PORT MASTER_SUB_PORT MASTER_SNI MASTER_PBK MASTER_SID MASTER_FP MASTER_SPX
+export MASTER_WS_ENABLED MASTER_WS_PORT MASTER_WS_SNI MASTER_WS_PATH MASTER_WS_FP
 export UK_HOST UK_VLESS_PORT UK_SNI UK_PBK UK_SID UK_FP UK_SPX
-export TR_HOST TR_VLESS_PORT TR_SNI TR_PBK TR_SID TR_FP TR_SPX
+export TR_HOST TR_LINK_HOST TR_VLESS_PORT TR_SNI TR_PBK TR_LINK_PBK TR_SID TR_FP TR_SPX
+export TR_WS_ENABLED TR_WS_HOST TR_WS_PORT TR_WS_SNI TR_WS_PATH TR_WS_FP
 
 python3 - <<'PY'
 import os, json, uuid, time, hashlib, base64, urllib.parse
@@ -388,6 +455,11 @@ master_pbk = os.environ['MASTER_PBK']
 master_sid = os.environ['MASTER_SID']
 master_fp = os.environ['MASTER_FP']
 master_spx = os.environ['MASTER_SPX']
+master_ws_enabled = os.environ.get('MASTER_WS_ENABLED', '0').strip().lower() in ('1', 'true', 'yes', 'on')
+master_ws_port = os.environ.get('MASTER_WS_PORT', '2053').strip()
+master_ws_sni = os.environ.get('MASTER_WS_SNI', '').strip() or master_host
+master_ws_path = os.environ.get('MASTER_WS_PATH', '/api/v1/stream').strip()
+master_ws_fp = os.environ.get('MASTER_WS_FP', 'chrome').strip()
 
 uk_host = os.environ.get('UK_HOST', '').strip()
 uk_uuid = os.environ.get('UK_UUID', '').strip()
@@ -399,13 +471,20 @@ uk_fp = os.environ.get('UK_FP', 'firefox').strip()
 uk_spx = os.environ.get('UK_SPX', '/').strip()
 
 tr_host = os.environ.get('TR_HOST', '').strip()
+tr_link_host = os.environ.get('TR_LINK_HOST', '').strip() or tr_host
 tr_uuid = os.environ.get('TR_UUID', '').strip()
 tr_port = os.environ.get('TR_VLESS_PORT', '443').strip()
 tr_sni = os.environ.get('TR_SNI', 'www.yahoo.com').strip()
-tr_pbk = os.environ.get('TR_PBK', '').strip()
+tr_pbk = os.environ.get('TR_LINK_PBK', '').strip() or os.environ.get('TR_PBK', '').strip()
 tr_sid = os.environ.get('TR_SID', 'ffffffffff').strip()
 tr_fp = os.environ.get('TR_FP', 'firefox').strip()
 tr_spx = os.environ.get('TR_SPX', '/').strip()
+tr_ws_enabled = os.environ.get('TR_WS_ENABLED', '0').strip().lower() in ('1', 'true', 'yes', 'on')
+tr_ws_host = os.environ.get('TR_WS_HOST', '').strip() or tr_host
+tr_ws_port = os.environ.get('TR_WS_PORT', '2053').strip()
+tr_ws_sni = os.environ.get('TR_WS_SNI', '').strip() or tr_ws_host
+tr_ws_path = os.environ.get('TR_WS_PATH', '/api/v1/stream').strip()
+tr_ws_fp = os.environ.get('TR_WS_FP', 'chrome').strip()
 
 clients = json.loads(clients_path.read_text(encoding='utf-8'))
 xray = json.loads(xray_path.read_text(encoding='utf-8'))
@@ -425,30 +504,47 @@ clients.append({
     'revoked': False,
 })
 
-added = False
-for ib in xray.get('inbounds', []):
-    if ib.get('protocol') == 'vless':
-        clients_list = ib.setdefault('settings', {}).setdefault('clients', [])
-        if any((c.get('email') or '').strip().lower() == name.lower() for c in clients_list):
-            raise SystemExit(f'user email already exists in xray config: {name}')
-        clients_list.append({
-            'id': us_uuid,
-            'flow': 'xtls-rprx-vision',
-            'email': name,
-        })
-        added = True
-        break
-
-if not added:
+vless_inbounds = [ib for ib in xray.get('inbounds', []) if ib.get('protocol') == 'vless']
+if not vless_inbounds:
     raise SystemExit('no vless inbound found in xray config')
 
+for ib in vless_inbounds:
+    clients_list = ib.setdefault('settings', {}).setdefault('clients', [])
+    if any((c.get('email') or '').strip().lower() == name.lower() for c in clients_list):
+        raise SystemExit(f'user email already exists in xray config: {name}')
+
+for ib in xray.get('inbounds', []):
+    if ib.get('protocol') != 'vless':
+        continue
+    stream = ib.get('streamSettings', {})
+    client = {'id': us_uuid, 'email': name}
+    if stream.get('network') == 'tcp' and stream.get('security') == 'reality':
+        client['flow'] = 'xtls-rprx-vision'
+    ib.setdefault('settings', {}).setdefault('clients', []).append(client)
+
 us_name = urllib.parse.quote('🇺🇸 США [VPN]', safe='')
+us_alt_name = urllib.parse.quote('🇺🇸 США ALT [WS]', safe='')
 gb_name = urllib.parse.quote('🇬🇧 Великобритания [VPN]', safe='')
 tr_name = urllib.parse.quote('🇹🇷 Турция [VPN]', safe='')
+tr_alt_name = urllib.parse.quote('🇹🇷 Турция ALT [WS]', safe='')
 
 links = []
 link1 = f"vless://{us_uuid}@{master_host}:{master_port}?encryption=none&type=tcp&security=reality&flow=xtls-rprx-vision&sni={master_sni}&fp={master_fp}&pbk={master_pbk}&sid={master_sid}&spx={master_spx}#{us_name}"
 links.append(link1)
+
+link_alt = None
+if master_ws_enabled:
+    ws_query = urllib.parse.urlencode({
+        'encryption': 'none',
+        'type': 'ws',
+        'security': 'tls',
+        'sni': master_ws_sni,
+        'host': master_ws_sni,
+        'fp': master_ws_fp,
+        'path': master_ws_path,
+    }, quote_via=urllib.parse.quote)
+    link_alt = f"vless://{us_uuid}@{master_host}:{master_ws_port}?{ws_query}#{us_alt_name}"
+    links.append(link_alt)
 
 link2 = None
 if uk_host and uk_uuid and uk_pbk:
@@ -456,9 +552,23 @@ if uk_host and uk_uuid and uk_pbk:
     links.append(link2)
 
 link3 = None
-if tr_host and tr_uuid and tr_pbk:
-    link3 = f"vless://{tr_uuid}@{tr_host}:{tr_port}?encryption=none&type=tcp&security=reality&flow=xtls-rprx-vision&sni={tr_sni}&fp={tr_fp}&pbk={tr_pbk}&sid={tr_sid}&spx={tr_spx}#{tr_name}"
+if tr_link_host and tr_uuid and tr_pbk:
+    link3 = f"vless://{tr_uuid}@{tr_link_host}:{tr_port}?encryption=none&type=tcp&security=reality&flow=xtls-rprx-vision&sni={tr_sni}&fp={tr_fp}&pbk={tr_pbk}&sid={tr_sid}&spx={tr_spx}#{tr_name}"
     links.append(link3)
+
+link_tr_alt = None
+if tr_ws_enabled and tr_ws_host and tr_uuid:
+    tr_ws_query = urllib.parse.urlencode({
+        'encryption': 'none',
+        'type': 'ws',
+        'security': 'tls',
+        'sni': tr_ws_sni,
+        'host': tr_ws_sni,
+        'fp': tr_ws_fp,
+        'path': tr_ws_path,
+    }, quote_via=urllib.parse.quote)
+    link_tr_alt = f"vless://{tr_uuid}@{tr_ws_host}:{tr_ws_port}?{tr_ws_query}#{tr_alt_name}"
+    links.append(link_tr_alt)
 
 payload = '\n'.join(links)
 encoded = base64.b64encode(payload.encode('utf-8')).decode('ascii')
@@ -472,10 +582,14 @@ os.chmod(xray_path, 0o644)
 print(f'USER {name}')
 print(f'UUID {us_uuid}')
 print(f'LINK1 {link1}')
+if link_alt:
+    print(f'LINK_ALT {link_alt}')
 if link2:
     print(f'LINK2 {link2}')
 if link3:
     print(f'LINK3 {link3}')
+if link_tr_alt:
+    print(f'LINK_TR_ALT {link_tr_alt}')
 print(f'SHORT_SUB https://{master_host}:{master_sub_port}/sub/{name}')
 print(f'SHORT_IOS https://{master_host}:{master_sub_port}/i/{name}/ios')
 print(f'SHORT_ANDROID https://{master_host}:{master_sub_port}/i/{name}/android')
@@ -514,6 +628,9 @@ if [[ -n "$UK_HOST" && -n "$UK_UUID" ]]; then
 fi
 if [[ -n "$TR_HOST" && -n "$TR_UUID" ]]; then
   [[ "$(remote_has_uuid "$TR_HOST" "$TR_UUID")" == "YES" ]] && echo "POSTCHECK tr_node OK"
+fi
+if [[ -n "$TR_LINK_SYNC_HOST" && -n "$TR_UUID" ]]; then
+  [[ "$(remote_has_uuid "$TR_LINK_SYNC_HOST" "$TR_UUID")" == "YES" ]] && echo "POSTCHECK ru_link_node OK"
 fi
 
 echo "BACKUPS: $BKP_CLIENTS $BKP_CFG"

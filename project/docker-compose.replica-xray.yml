@@ -6,6 +6,7 @@ services:
     command: ["run", "-config", "/usr/local/etc/xray/config.json"]
     ports:
       - "443:443/tcp"
+      - "127.0.0.1:10086:10086/tcp"
     volumes:
       - /usr/local/etc/xray:/usr/local/etc/xray
     logging:
@@ -13,4 +14,3 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-

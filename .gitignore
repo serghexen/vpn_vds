@@ -1,6 +1,8 @@
 # Secrets and runtime state
+/backups/
 project/master/
 project/env/bot.env
+project/env/hysteria.env
 project/xray/config.json
 project/state/clients.json
 project/state/*.db
@@ -13,3 +15,15 @@ project/env/ssh/
 
 __pycache__/
 *.pyc
+
+# Owner-only XHTTP test runtime credentials
+project/xhttp-test/.env
+project/xhttp-test/config.json
+project/xhttp-test/manifest.json
+project/xhttp-test/subscription.b64
+
+# Owner-only Trojan test runtime credentials
+project/trojan-test/.env
+project/trojan-test/config.json
+project/trojan-test/manifest.json
+project/trojan-test/subscription.b64

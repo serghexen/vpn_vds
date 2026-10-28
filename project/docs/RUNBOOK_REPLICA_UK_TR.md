@@ -14,6 +14,11 @@ project/scripts/healthcheck_replica.sh --node uk
 project/scripts/healthcheck_replica.sh --node tr
 ```
 
+Проверка цепочки `RU -> TR` (если включен bridge-режим через `TR_LINK_HOST`):
+```bash
+project/scripts/healthcheck_ru_tr_bridge.sh
+```
+
 Проверка с конкретным пользователем:
 ```bash
 project/scripts/healthcheck_replica.sh --node uk --user test1
@@ -25,6 +30,20 @@ project/scripts/healthcheck_replica.sh --node uk --user test1
 - порт `443` в LISTEN;
 - дубли `id/email` в `/usr/local/etc/xray/config.json`;
 - (опционально) что пользователь есть ровно 1 раз.
+
+## Что проверяет `healthcheck_ru_tr_bridge.sh`
+- что `TR_LINK_HOST` (RU) и `TR_HOST` доступны по SSH;
+- что `xray` активен и на RU, и на TR;
+- что RU принимает пользователей (и опционально `--user`);
+- что RU outbound смотрит на `TR_HOST:TR_VLESS_PORT`;
+- что bridge UUID из RU outbound существует в TR inbound;
+- что `publicKey` RU->TR совпадает с фактическим TR REALITY public key;
+- что `TR_LINK_PBK` (или fallback `TR_PBK`) совпадает с фактическим RU REALITY public key.
+
+Важно:
+- в bridge-режиме ключ для ссылки на турецкий профиль должен задаваться в `TR_LINK_PBK` (это ключ RU-входа);
+- `TR_PBK` можно оставить для обратной совместимости, но предпочтительно использовать `TR_LINK_PBK`.
+- скрипты `vless-add-user`/`vless-del-user` в bridge-режиме автоматически синхронизируют пользователя и на RU-вход (`TR_LINK_HOST`), чтобы новые аккаунты сразу работали через `RU -> TR`.
 
 ## Мягкий рестарт Xray на реплике
 
